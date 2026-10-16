@@ -27,6 +27,7 @@ const {
   shell,
   session,
   Notification,
+  safeStorage,
 } = require("electron");
 const path = require("path");
 const { spawn } = require("child_process");
@@ -85,6 +86,25 @@ let isServerStopped = false;
 let remoteServerPromptWindow = null;
 let keepAliveWithoutWindows = false;
 let lastRendererUrl = null;
+let serverStartupError = null;
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>"']/g, (char) => {
+    const entities = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
+    return entities[char];
+  });
+}
+
+function buildStartupErrorPage(error) {
+  const safeError = escapeHtml(error);
+  const html = `<!doctype html><meta charset="utf-8"><title>OmniRoute setup</title>
+    <body style="margin:0;background:#0a0a0a;color:#f2f2f2;font:16px system-ui;padding:48px">
+    <main style="max-width:720px;margin:auto"><h1>OmniRoute could not start its local server</h1>
+    <p>${safeError}</p><h2>Linux credential-store setup</h2>
+    <p>Unlock or install a desktop Secret Service/keyring (for example GNOME Keyring), then quit and reopen OmniRoute from your desktop app menu or launcher. OmniRoute will keep provider credentials encrypted in its local database and protect the database key with your OS credential store.</p>
+    <p>Existing usage data stays in the local OmniRoute data folder. If this message mentions an existing encrypted database, restore its prior encryption key from your backup before starting.</p></main></body>`;
+  return `data:text/html;charset=utf-8,${encodeURIComponent(html)}`;
+}
 
 // ── Remote Server Mode ──────────────────────────────────────
 // Lets the desktop shell attach to an already-running OmniRoute server (e.g. a
@@ -412,8 +432,13 @@ function createWindow({ showWhenReady = true } = {}) {
   });
   mainWindow = window;
 
-  // Load the Next.js app
-  window.loadURL(resolveRendererUrl(lastRendererUrl, getServerUrl()));
+  // A local setup page keeps secure-storage failures actionable instead of leaving
+  // the user at a blank dashboard that waits for a server which did not start.
+  if (serverStartupError) {
+    window.loadURL(buildStartupErrorPage(serverStartupError));
+  } else {
+    window.loadURL(resolveRendererUrl(lastRendererUrl, getServerUrl()));
+  }
   if (isDev) {
     window.webContents.openDevTools({ mode: "detach" });
   }
@@ -598,7 +623,7 @@ async function changePort(newPort) {
   await waitForServerExit(serverToStop);
 
   // Start server on new port
-  startNextServer();
+  await startNextServer();
   await waitForServer(getServerReadinessUrl());
 
   // Reload window and update tray
@@ -669,7 +694,7 @@ async function setRemoteServerUrl(nextUrl) {
   writeRemoteServerUrl(REMOTE_SERVER_PREFS_PATH, remoteServerUrl);
   lastRendererUrl = getServerUrl();
 
-  startNextServer();
+  await startNextServer();
   try {
     await waitForServer(getServerReadinessUrl());
   } catch (err) {
@@ -694,8 +719,9 @@ async function setRemoteServerUrl(nextUrl) {
 }
 
 // ── Server Lifecycle (#1, #5, #10) ─────────────────────────
-function startNextServer() {
+async function startNextServer() {
   if (remoteServerUrl) {
+    serverStartupError = null;
     console.log("[Electron] Remote server mode — connecting to", remoteServerUrl);
     sendToRenderer("server-status", {
       status: "running",
@@ -706,6 +732,7 @@ function startNextServer() {
   }
 
   if (isDev) {
+    serverStartupError = null;
     console.log("[Electron] Dev mode — connect to existing Next.js server");
     sendToRenderer("server-status", { status: "running", port: serverPort });
     return;
@@ -725,9 +752,9 @@ function startNextServer() {
   // ── Zero-config bootstrap: auto-generate required secrets ─────────────────
   // Electron uses CJS — cannot dynamically import ESM bootstrap-env.mjs.
   // This mirrors bootstrap-env.mjs logic synchronously:
-  //   1. Read persisted secrets from the resolved DATA_DIR/server.env
-  //   2. Generate missing secrets with crypto.randomBytes()
-  //   3. Persist back to DATA_DIR/server.env for future restarts
+  //   1. Read app secrets from DATA_DIR/server.env
+  //   2. Load the DB credential-encryption key from Electron safeStorage
+  //   3. Migrate any legacy plaintext key into safeStorage, then remove it from server.env
   const crypto = require("crypto");
 
   // Parse a simple KEY=VALUE file
@@ -748,32 +775,83 @@ function startNextServer() {
   const preferredEnv = preferredEnvPath ? parseEnvFile(preferredEnvPath) : {};
   const dataDir = resolveDataDir(null, { ...preferredEnv, ...process.env });
   const serverEnvPath = path.join(dataDir, "server.env");
+  const encryptedStorageKeyPath = path.join(dataDir, "storage-encryption-key.safe");
   const persisted = parseEnvFile(serverEnvPath);
   const serverEnv = { ...persisted, ...preferredEnv, ...process.env };
   let changed = false;
+  let shouldReEncryptStorageKey = false;
 
   if (!serverEnv.JWT_SECRET) {
     serverEnv.JWT_SECRET = persisted.JWT_SECRET = crypto.randomBytes(64).toString("hex");
     changed = true;
     console.log("[Electron] ✨ JWT_SECRET auto-generated");
   }
-  if (!serverEnv.STORAGE_ENCRYPTION_KEY) {
-    if (hasEncryptedCredentials(path.join(dataDir, "storage.sqlite"))) {
-      console.error(
-        `[Electron] Refusing to auto-generate STORAGE_ENCRYPTION_KEY: encrypted credentials already exist in ${path.join(
-          dataDir,
-          "storage.sqlite"
-        )}. Restore the key via ${preferredEnvPath || "an appropriate .env file"}, ${serverEnvPath}, or process.env.`
+  try {
+    const explicitlyConfiguredKey =
+      process.env.STORAGE_ENCRYPTION_KEY || preferredEnv.STORAGE_ENCRYPTION_KEY || null;
+    let storageEncryptionKey = serverEnv.STORAGE_ENCRYPTION_KEY || null;
+    const hasSecureBackend =
+      typeof safeStorage.isAsyncEncryptionAvailable === "function" &&
+      (await safeStorage.isAsyncEncryptionAvailable()) &&
+      (process.platform !== "linux" ||
+        (typeof safeStorage.getSelectedStorageBackend === "function" &&
+          safeStorage.getSelectedStorageBackend() !== "basic_text"));
+
+    if (!hasSecureBackend) {
+      throw new Error(
+        "No secure OS credential store is available. On Linux, install and unlock a Secret Service or desktop keyring, then restart OmniRoute."
       );
-      sendToRenderer("server-status", { status: "error", port: serverPort });
-      return;
     }
-    serverEnv.STORAGE_ENCRYPTION_KEY = persisted.STORAGE_ENCRYPTION_KEY = crypto
-      .randomBytes(32)
-      .toString("hex");
-    serverEnv.STORAGE_ENCRYPTION_KEY_VERSION = persisted.STORAGE_ENCRYPTION_KEY_VERSION = "v1";
-    changed = true;
-    console.log("[Electron] ✨ STORAGE_ENCRYPTION_KEY auto-generated");
+
+    // Prefer the user's explicit environment key, then a legacy server.env key,
+    // then the OS-protected persisted key.
+    if (!storageEncryptionKey && fs.existsSync(encryptedStorageKeyPath)) {
+      if (!hasSecureBackend) {
+        throw new Error("The OS credential store is unavailable for the saved encryption key.");
+      }
+      const encryptedKey = fs.readFileSync(encryptedStorageKeyPath);
+      const decrypted = await safeStorage.decryptStringAsync(encryptedKey);
+      storageEncryptionKey = decrypted.result;
+      shouldReEncryptStorageKey = decrypted.shouldReEncrypt === true;
+    }
+
+    if (!storageEncryptionKey) {
+      if (hasEncryptedCredentials(path.join(dataDir, "storage.sqlite"))) {
+        throw new Error(
+          `Encrypted provider credentials exist in ${path.join(dataDir, "storage.sqlite")}, but the saved OS credential is missing. Restore it from a backup or configure STORAGE_ENCRYPTION_KEY explicitly.`
+        );
+      }
+      storageEncryptionKey = crypto.randomBytes(32).toString("hex");
+      console.log("[Electron] Created a new database credential-encryption key");
+    }
+
+    serverEnv.STORAGE_ENCRYPTION_KEY = storageEncryptionKey;
+    serverStartupError = null;
+    if (hasSecureBackend) {
+      const legacyPlaintextKey = persisted.STORAGE_ENCRYPTION_KEY;
+      if (
+        !fs.existsSync(encryptedStorageKeyPath) ||
+        legacyPlaintextKey ||
+        explicitlyConfiguredKey ||
+        shouldReEncryptStorageKey
+      ) {
+        const encryptedKey = await safeStorage.encryptStringAsync(storageEncryptionKey);
+        fs.mkdirSync(dataDir, { recursive: true, mode: 0o700 });
+        fs.writeFileSync(encryptedStorageKeyPath, encryptedKey, { mode: 0o600 });
+      }
+      if (legacyPlaintextKey || persisted.STORAGE_ENCRYPTION_KEY_VERSION) {
+        delete persisted.STORAGE_ENCRYPTION_KEY;
+        delete persisted.STORAGE_ENCRYPTION_KEY_VERSION;
+        changed = true;
+        console.log("[Electron] Migrated the legacy database key into OS credential storage");
+      }
+    }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    serverStartupError = message;
+    console.error("[Electron] Secure credential bootstrap failed:", message);
+    sendToRenderer("server-status", { status: "error", port: serverPort, error: message });
+    return;
   }
   if (!serverEnv.API_KEY_SECRET) {
     serverEnv.API_KEY_SECRET = persisted.API_KEY_SECRET = crypto.randomBytes(32).toString("hex");
@@ -790,8 +868,8 @@ function startNextServer() {
         ...Object.entries(persisted).map(([k, v]) => `${k}=${v}`),
         "",
       ];
-      fs.writeFileSync(serverEnvPath, lines.join("\n"), "utf8");
-      console.log("[Electron] 📁 Secrets persisted to:", serverEnvPath);
+      fs.writeFileSync(serverEnvPath, lines.join("\n"), { encoding: "utf8", mode: 0o600 });
+      console.log("[Electron] 📁 App bootstrap secrets persisted to:", serverEnvPath);
     } catch (e) {
       console.warn("[Electron] Could not persist secrets:", e.message);
     }
@@ -1010,7 +1088,7 @@ function setupIpcHandlers() {
     const serverToStop = nextServer;
     stopNextServer();
     await waitForServerExit(serverToStop);
-    startNextServer();
+    await startNextServer();
     await waitForServer(getServerReadinessUrl());
     return { success: true };
   });
@@ -1156,13 +1234,13 @@ app.whenReady().then(async () => {
   keepAliveWithoutWindows = startHidden;
 
   // Fix #1: Start server and WAIT for readiness before showing window
-  startNextServer();
+  await startNextServer();
   if (!isHeadless) {
     createTray();
   }
 
-  let serverReady = true;
-  if (!isDev) {
+  let serverReady = !serverStartupError;
+  if (!isDev && serverReady) {
     // Probe the lightweight auth-exempt endpoint instead of aggregating full monitoring state.
     serverReady = await waitForServer(getServerReadinessUrl());
   }

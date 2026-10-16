@@ -422,7 +422,7 @@ export function migrateUsageJsonToSqlite() {
 
             if (detailExpected) {
               const artifact: CallLogArtifact = {
-                schemaVersion: 5,
+                schemaVersion: 6,
                 summary: {
                   id,
                   timestamp,
@@ -436,11 +436,22 @@ export function migrateUsageJsonToSqlite() {
                   connectionId: log.connectionId || null,
                   duration: log.duration || 0,
                   tokens: {
-                    in: log.tokens?.in ?? 0,
-                    out: log.tokens?.out ?? 0,
-                    cacheRead: null,
-                    cacheWrite: null,
-                    reasoning: null,
+                    in: log.tokens?.in ?? null,
+                    out: log.tokens?.out ?? null,
+                    inputStatus: log.tokens?.in == null ? "unavailable" : "legacy_unknown",
+                    outputStatus: log.tokens?.out == null ? "unavailable" : "legacy_unknown",
+                    sourceReportedInput: null,
+                    cacheRead: log.tokens?.cacheRead ?? null,
+                    cacheReadStatus:
+                      log.tokens?.cacheRead == null ? "unavailable" : "legacy_unknown",
+                    cacheWrite: log.tokens?.cacheWrite ?? null,
+                    cacheCreationStatus:
+                      log.tokens?.cacheWrite == null ? "unavailable" : "legacy_unknown",
+                    reasoning: log.tokens?.reasoning ?? null,
+                    reasoningStatus:
+                      log.tokens?.reasoning == null ? "unavailable" : "legacy_unknown",
+                    noCache: null,
+                    noCacheStatus: "unavailable",
                   },
                   requestType: log.requestType || null,
                   sourceFormat: log.sourceFormat || null,

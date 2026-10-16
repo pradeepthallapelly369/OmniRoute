@@ -26,6 +26,7 @@ export function getPromptCacheReadTokens(tokens: unknown): number {
   return toFiniteNumber(
     tokenRecord.cacheRead ??
       tokenRecord.cache_read_input_tokens ??
+      tokenRecord.cachedContentTokenCount ??
       tokenRecord.cached_tokens ??
       promptDetails.cached_tokens
   );
@@ -91,12 +92,72 @@ export function getLoggedInputTokens(tokens: unknown): number {
   return 0;
 }
 
+/** Prompt/input count, preserving the distinction between an absent field and an explicit 0. */
+export function getLoggedInputTokensOrNull(tokens: unknown): number | null {
+  const tokenRecord = asRecord(tokens);
+  if (tokenRecord.input !== undefined && tokenRecord.input !== null) {
+    return getValidTokenCount(tokenRecord.input);
+  }
+  if (tokenRecord.prompt_tokens !== undefined && tokenRecord.prompt_tokens !== null) {
+    return getValidTokenCount(tokenRecord.prompt_tokens);
+  }
+  if (tokenRecord.input_tokens !== undefined && tokenRecord.input_tokens !== null) {
+    const input = getValidTokenCount(tokenRecord.input_tokens);
+    const cacheRead = getValidTokenCount(tokenRecord.cache_read_input_tokens);
+    const cacheCreation = getValidTokenCount(tokenRecord.cache_creation_input_tokens);
+    if (input === null) return null;
+    return input + (cacheRead ?? 0) + (cacheCreation ?? 0);
+  }
+  return null;
+}
+
 export function getLoggedOutputTokens(tokens: unknown): number {
   const tokenRecord = asRecord(tokens);
   if (tokenRecord.output !== undefined && tokenRecord.output !== null) {
     return toFiniteNumber(tokenRecord.output);
   }
   return toFiniteNumber(tokenRecord.completion_tokens ?? tokenRecord.output_tokens);
+}
+
+/** Completion/output count, preserving an explicitly reported zero. */
+export function getLoggedOutputTokensOrNull(tokens: unknown): number | null {
+  const tokenRecord = asRecord(tokens);
+  const value = tokenRecord.output ?? tokenRecord.completion_tokens ?? tokenRecord.output_tokens;
+  return value === undefined || value === null ? null : getValidTokenCount(value);
+}
+
+const INPUT_ESTIMATED_MARKER = Symbol.for("omniroute.usage.input-estimated");
+const SOURCE_REPORTED_INPUT_MARKER = Symbol.for("omniroute.usage.source-reported-input");
+
+export function isInputUsageEstimated(tokens: unknown): boolean {
+  if (!tokens || typeof tokens !== "object") return false;
+  return (
+    (tokens as JsonRecord).estimated === true ||
+    Reflect.get(tokens, Symbol.for("omniroute.usage.estimated")) === true ||
+    Reflect.get(tokens, INPUT_ESTIMATED_MARKER) === true
+  );
+}
+
+export function isOutputUsageEstimated(tokens: unknown): boolean {
+  if (!tokens || typeof tokens !== "object") return false;
+  const record = tokens as JsonRecord;
+  // `estimated` also marks input-only repairs. In that case an independently
+  // reported completion remains reported.
+  if (Reflect.get(tokens, INPUT_ESTIMATED_MARKER) === true) {
+    const output = record.output ?? record.completion_tokens ?? record.output_tokens;
+    return output === undefined || output === null;
+  }
+  return (
+    record.estimated === true ||
+    Reflect.get(tokens, Symbol.for("omniroute.usage.estimated")) === true
+  );
+}
+
+/** Original input count retained in a non-enumerable marker when a guard repairs it. */
+export function getSourceReportedInputTokens(tokens: unknown): number | null {
+  if (!tokens || typeof tokens !== "object") return null;
+  const value = Reflect.get(tokens, SOURCE_REPORTED_INPUT_MARKER);
+  return getValidTokenCount(value);
 }
 
 /**
@@ -110,7 +171,10 @@ export function getReasoningTokens(tokens: unknown): number {
   const tokenRecord = asRecord(tokens);
   const completionDetails = asRecord(tokenRecord.completion_tokens_details);
   return toFiniteNumber(
-    tokenRecord.reasoning ?? tokenRecord.reasoning_tokens ?? completionDetails.reasoning_tokens
+    tokenRecord.reasoning ??
+      tokenRecord.reasoning_tokens ??
+      tokenRecord.thoughtsTokenCount ??
+      completionDetails.reasoning_tokens
   );
 }
 
@@ -161,7 +225,25 @@ export function getObservedReasoning(message: unknown): {
 // vs `0` when the provider explicitly reported zero.
 
 function hasAnyKey(record: JsonRecord, keys: string[]): boolean {
-  return keys.some((k) => record[k] !== undefined && record[k] !== null);
+  return keys.some((key) => getValidTokenCount(record[key]) !== null);
+}
+
+function getValidTokenCount(value: unknown): number | null {
+  const count =
+    typeof value === "number"
+      ? value
+      : typeof value === "string" && /^\d+$/.test(value.trim())
+        ? Number(value)
+        : NaN;
+  return Number.isSafeInteger(count) && count >= 0 ? count : null;
+}
+
+function getFirstValidTokenCount(record: JsonRecord, keys: string[]): number | null {
+  for (const key of keys) {
+    const value = getValidTokenCount(record[key]);
+    if (value !== null) return value;
+  }
+  return null;
 }
 
 /**
@@ -171,13 +253,14 @@ function hasAnyKey(record: JsonRecord, keys: string[]): boolean {
 export function getPromptCacheReadTokensOrNull(tokens: unknown): number | null {
   const tokenRecord = asRecord(tokens);
   const promptDetails = getPromptTokenDetails(tokenRecord);
-  if (
-    hasAnyKey(tokenRecord, ["cacheRead", "cache_read_input_tokens", "cached_tokens"]) ||
-    hasAnyKey(promptDetails, ["cached_tokens"])
-  ) {
-    return getPromptCacheReadTokens(tokens);
-  }
-  return null;
+  return (
+    getFirstValidTokenCount(tokenRecord, [
+      "cacheRead",
+      "cache_read_input_tokens",
+      "cachedContentTokenCount",
+      "cached_tokens",
+    ]) ?? getFirstValidTokenCount(promptDetails, ["cached_tokens"])
+  );
 }
 
 /**
@@ -187,13 +270,10 @@ export function getPromptCacheReadTokensOrNull(tokens: unknown): number | null {
 export function getPromptCacheCreationTokensOrNull(tokens: unknown): number | null {
   const tokenRecord = asRecord(tokens);
   const promptDetails = getPromptTokenDetails(tokenRecord);
-  if (
-    hasAnyKey(tokenRecord, [...CACHE_CREATION_TOKEN_KEYS]) ||
-    hasAnyKey(promptDetails, [...CACHE_CREATION_TOKEN_DETAIL_KEYS])
-  ) {
-    return getPromptCacheCreationTokens(tokens);
-  }
-  return null;
+  return (
+    getFirstValidTokenCount(tokenRecord, [...CACHE_CREATION_TOKEN_KEYS]) ??
+    getFirstValidTokenCount(promptDetails, [...CACHE_CREATION_TOKEN_DETAIL_KEYS])
+  );
 }
 
 /**
@@ -203,13 +283,10 @@ export function getPromptCacheCreationTokensOrNull(tokens: unknown): number | nu
 export function getReasoningTokensOrNull(tokens: unknown): number | null {
   const tokenRecord = asRecord(tokens);
   const completionDetails = asRecord(tokenRecord.completion_tokens_details);
-  if (
-    hasAnyKey(tokenRecord, ["reasoning", "reasoning_tokens"]) ||
-    hasAnyKey(completionDetails, ["reasoning_tokens"])
-  ) {
-    return getReasoningTokens(tokens);
-  }
-  return null;
+  return (
+    getFirstValidTokenCount(tokenRecord, ["reasoning", "reasoning_tokens", "thoughtsTokenCount"]) ??
+    getFirstValidTokenCount(completionDetails, ["reasoning_tokens"])
+  );
 }
 
 /**
@@ -221,12 +298,12 @@ export function getReasoningTokensOrNull(tokens: unknown): number | null {
 export function getNoCacheTokens(tokens: unknown): number | null {
   const tokenRecord = asRecord(tokens);
   const promptDetails = getPromptTokenDetails(tokenRecord);
-  if (hasAnyKey(tokenRecord, ["no_cache_tokens"]) || hasAnyKey(promptDetails, ["noCacheTokens"])) {
-    return toFiniteNumber(
-      tokenRecord.no_cache_tokens ?? promptDetails.noCacheTokens ?? tokenRecord.noCacheTokens
-    );
-  }
-  return null;
+  const inputDetails = asRecord(tokenRecord.inputTokenDetails);
+  return (
+    getFirstValidTokenCount(tokenRecord, ["no_cache_tokens", "noCacheTokens"]) ??
+    getFirstValidTokenCount(promptDetails, ["noCacheTokens"]) ??
+    getFirstValidTokenCount(inputDetails, ["noCacheTokens"])
+  );
 }
 
 export function formatUsageLog(tokens: unknown): string {

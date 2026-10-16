@@ -18,7 +18,10 @@ export function extractUsageFromResponse(responseBody, provider) {
   if (
     responseBody.usage &&
     typeof responseBody.usage === "object" &&
-    responseBody.usage.prompt_tokens !== undefined
+    (responseBody.usage.prompt_tokens !== undefined ||
+      responseBody.usage.input_tokens !== undefined ||
+      responseBody.usage.completion_tokens !== undefined ||
+      responseBody.usage.output_tokens !== undefined)
   ) {
     const cacheCreationTokens =
       responseBody.usage.cache_creation_input_tokens ??
@@ -28,8 +31,17 @@ export function extractUsageFromResponse(responseBody, provider) {
       responseBody.usage.input_tokens_details?.cache_write_tokens ??
       responseBody.usage.cache_write_tokens;
     const openAiUsage = {
-      prompt_tokens: responseBody.usage.prompt_tokens || 0,
-      completion_tokens: responseBody.usage.completion_tokens || 0,
+      ...(responseBody.usage.prompt_tokens !== undefined ||
+      responseBody.usage.input_tokens !== undefined
+        ? { prompt_tokens: responseBody.usage.prompt_tokens ?? responseBody.usage.input_tokens }
+        : {}),
+      ...(responseBody.usage.completion_tokens !== undefined ||
+      responseBody.usage.output_tokens !== undefined
+        ? {
+            completion_tokens:
+              responseBody.usage.completion_tokens ?? responseBody.usage.output_tokens,
+          }
+        : {}),
       // DeepSeek native API uses flat prompt_cache_hit_tokens (NOT
       // prompt_tokens_details.cached_tokens). Fall back to it so V4 cache
       // gets surfaced into kanban call_logs alongside the OpenAI/Claude paths.
@@ -75,22 +87,37 @@ export function extractUsageFromResponse(responseBody, provider) {
     (responseBody.usage.input_tokens !== undefined ||
       responseBody.usage.output_tokens !== undefined)
   ) {
-    const inputTokens = responseBody.usage.input_tokens || 0;
-    const cacheRead = responseBody.usage.cache_read_input_tokens || 0;
-    const cacheCreation = responseBody.usage.cache_creation_input_tokens || 0;
+    const inputTokens = responseBody.usage.input_tokens;
+    const cacheRead = responseBody.usage.cache_read_input_tokens;
+    const cacheCreation = responseBody.usage.cache_creation_input_tokens;
 
     // Total prompt tokens = input + cache_read + cache_creation (per Claude API docs)
-    const promptTokens = inputTokens + cacheRead + cacheCreation;
-
-    return {
-      prompt_tokens: promptTokens,
-      completion_tokens: responseBody.usage.output_tokens || 0,
-      cache_read_input_tokens: cacheRead,
-      cache_creation_input_tokens: cacheCreation,
+    const promptReported =
+      inputTokens !== undefined || cacheRead !== undefined || cacheCreation !== undefined;
+    const inputWasEstimated =
+      Reflect.get(responseBody.usage, Symbol.for("omniroute.usage.input-estimated")) === true;
+    const normalized = {
+      ...(promptReported
+        ? {
+            prompt_tokens: inputWasEstimated
+              ? typeof inputTokens === "number"
+                ? inputTokens
+                : 0
+              : (typeof inputTokens === "number" ? inputTokens : 0) +
+                (typeof cacheRead === "number" ? cacheRead : 0) +
+                (typeof cacheCreation === "number" ? cacheCreation : 0),
+          }
+        : {}),
+      ...(responseBody.usage.output_tokens !== undefined
+        ? { completion_tokens: responseBody.usage.output_tokens }
+        : {}),
+      ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+      ...(cacheCreation !== undefined ? { cache_creation_input_tokens: cacheCreation } : {}),
       ...(typeof responseBody.usage.output_tokens_details?.thinking_tokens === "number"
         ? { reasoning_tokens: responseBody.usage.output_tokens_details.thinking_tokens }
         : {}),
     };
+    return carryEstimatedUsageMarker(responseBody.usage, normalized);
   }
 
   // OpenAI Responses API format (input_tokens / output_tokens)
@@ -100,20 +127,40 @@ export function extractUsageFromResponse(responseBody, provider) {
     typeof responsesUsage === "object" &&
     (responsesUsage.input_tokens !== undefined || responsesUsage.output_tokens !== undefined)
   ) {
-    return {
-      prompt_tokens: responsesUsage.input_tokens || 0,
-      completion_tokens: responsesUsage.output_tokens || 0,
-      cache_read_input_tokens: responsesUsage.cache_read_input_tokens,
-      cached_tokens:
-        responsesUsage.input_tokens_details?.cached_tokens ??
-        responsesUsage.prompt_tokens_details?.cached_tokens ??
-        responsesUsage.cache_read_input_tokens,
-      cache_creation_input_tokens: responsesUsage.cache_creation_input_tokens,
-      reasoning_tokens:
-        responsesUsage.output_tokens_details?.reasoning_tokens ??
-        responsesUsage.completion_tokens_details?.reasoning_tokens ??
-        responsesUsage.reasoning_tokens,
+    const normalized = {
+      ...(responsesUsage.input_tokens !== undefined
+        ? { prompt_tokens: responsesUsage.input_tokens }
+        : {}),
+      ...(responsesUsage.output_tokens !== undefined
+        ? { completion_tokens: responsesUsage.output_tokens }
+        : {}),
+      ...(responsesUsage.cache_read_input_tokens !== undefined
+        ? { cache_read_input_tokens: responsesUsage.cache_read_input_tokens }
+        : {}),
+      ...(responsesUsage.input_tokens_details?.cached_tokens !== undefined ||
+      responsesUsage.prompt_tokens_details?.cached_tokens !== undefined
+        ? {
+            cached_tokens:
+              responsesUsage.input_tokens_details?.cached_tokens ??
+              responsesUsage.prompt_tokens_details?.cached_tokens ??
+              responsesUsage.cache_read_input_tokens,
+          }
+        : {}),
+      ...(responsesUsage.cache_creation_input_tokens !== undefined
+        ? { cache_creation_input_tokens: responsesUsage.cache_creation_input_tokens }
+        : {}),
+      ...(responsesUsage.output_tokens_details?.reasoning_tokens !== undefined ||
+      responsesUsage.completion_tokens_details?.reasoning_tokens !== undefined ||
+      responsesUsage.reasoning_tokens !== undefined
+        ? {
+            reasoning_tokens:
+              responsesUsage.output_tokens_details?.reasoning_tokens ??
+              responsesUsage.completion_tokens_details?.reasoning_tokens ??
+              responsesUsage.reasoning_tokens,
+          }
+        : {}),
     };
+    return carryEstimatedUsageMarker(responsesUsage, normalized);
   }
 
   // Gemini format. Antigravity / gemini-cli wrap the payload in
@@ -124,12 +171,25 @@ export function extractUsageFromResponse(responseBody, provider) {
     // Gemini reports thoughts outside candidates. Fold them into completion so
     // every provider keeps reasoning as a subset of completion tokens.
     const thoughts = usageMetadata.thoughtsTokenCount || 0;
-    return {
-      prompt_tokens: usageMetadata.promptTokenCount || 0,
-      completion_tokens: (usageMetadata.candidatesTokenCount || 0) + thoughts,
-      cached_tokens: usageMetadata.cachedContentTokenCount || 0,
-      reasoning_tokens: thoughts,
+    const normalized = {
+      ...(usageMetadata.promptTokenCount !== undefined
+        ? { prompt_tokens: usageMetadata.promptTokenCount }
+        : {}),
+      ...(usageMetadata.candidatesTokenCount !== undefined ||
+      usageMetadata.thoughtsTokenCount !== undefined
+        ? {
+            completion_tokens:
+              (usageMetadata.candidatesTokenCount || 0) + (usageMetadata.thoughtsTokenCount || 0),
+          }
+        : {}),
+      ...(usageMetadata.cachedContentTokenCount !== undefined
+        ? { cached_tokens: usageMetadata.cachedContentTokenCount }
+        : {}),
+      ...(usageMetadata.thoughtsTokenCount !== undefined
+        ? { reasoning_tokens: usageMetadata.thoughtsTokenCount }
+        : {}),
     };
+    return carryEstimatedUsageMarker(usageMetadata, normalized);
   }
 
   return null;

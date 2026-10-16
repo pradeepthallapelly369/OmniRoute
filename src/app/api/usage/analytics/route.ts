@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
+import { createHash } from "node:crypto";
 export const dynamic = "force-dynamic";
-import { getProviderById } from "@/shared/constants/providers";
+import { getProviderById, isLocalProvider } from "@/shared/constants/providers";
 import { requireManagementAuth } from "@/lib/api/requireManagementAuth";
 import { getApiKeys } from "@/lib/db/apiKeys";
 import { getUserDatabaseSettings } from "@/lib/db/databaseSettings";
@@ -26,6 +27,14 @@ import { getFallbackStats, getErrorTypeBreakdown } from "@/lib/db/callLogStats";
 import { buildByProviderRows } from "@/lib/usage/providerDisplayNames";
 import { isFlatRateProvider } from "@/lib/usage/flatRateProviders";
 import { toNumber } from "@/shared/utils/numeric";
+import {
+  getTokenUsageBreakdownRows,
+  getTokenUsageDailyRows,
+  getTokenUsageMonthlyRows,
+  getTokenUsageSourceRows,
+  getUsageConnectionStatusRows,
+} from "@/lib/db/tokenUsageAnalytics";
+import { saveRequestUsage } from "@/lib/usage/usageHistory";
 
 function getRangeStartIso(range: string): string | null {
   const end = new Date();
@@ -287,6 +296,24 @@ function computeUsageRowCost(
   );
 }
 
+function hasUsageRowPricing(
+  row: Record<string, unknown>,
+  pricingByProvider: PricingByProvider,
+  providerAliasMap: Record<string, string>,
+  normalizeModelName: (model: string) => string,
+  flatRateAsZero = true
+): boolean {
+  const provider = toStringValue(row.provider);
+  const model = toStringValue(row.model);
+  if (!provider || !model) return false;
+  const isAggregated = toNumber(row.isAggregated ?? row.is_aggregated) > 0;
+  if (isAggregated && toNumber(row.storedCost ?? row.stored_cost) > 0) return true;
+  if (flatRateAsZero && isFlatRateProvider(provider)) return false;
+  return Boolean(
+    resolveModelPricing(pricingByProvider, providerAliasMap, provider, model, normalizeModelName)
+  );
+}
+
 function computeUsageRowStandardCost(
   row: Record<string, unknown>,
   pricingByProvider: PricingByProvider,
@@ -358,6 +385,8 @@ export async function GET(request: Request) {
     const endDate = searchParams.get("endDate") || undefined;
     const apiKeyIdsParam = searchParams.get("apiKeyIds") || "";
     const apiKeyIds = apiKeyIdsParam ? apiKeyIdsParam.split(",").filter(Boolean) : [];
+    const providerFilter = searchParams.get("provider")?.trim() || "";
+    const modelFilter = searchParams.get("model")?.trim() || "";
     // Flat-rate subscriptions are $0 in billed-cost analytics by default. The
     // dedicated costs page opts into their token-price equivalent so subscription
     // consumption can be compared with metered providers without changing budgets.
@@ -396,14 +425,28 @@ export async function GET(request: Request) {
     }
 
     let apiKeyWhere = "";
+    const unifiedFilters: string[] = [];
     if (apiKeyIds.length > 0) {
       const placeholders = apiKeyIds.map((_, i) => `@apiKey${i}`);
       apiKeyIds.forEach((key, i) => {
         params[`apiKey${i}`] = key;
       });
-      apiKeyWhere = `(api_key_name IN (${placeholders.join(",")}) OR api_key_id IN (${placeholders.join(",")}))`;
-      conditions.push(apiKeyWhere);
+      unifiedFilters.push(
+        `(api_key_name IN (${placeholders.join(",")}) OR api_key_id IN (${placeholders.join(",")}))`
+      );
+      conditions.push(unifiedFilters[unifiedFilters.length - 1]);
     }
+    if (providerFilter) {
+      params.providerFilter = `%${providerFilter}%`;
+      unifiedFilters.push("LOWER(provider) LIKE LOWER(@providerFilter)");
+      conditions.push("LOWER(provider) LIKE LOWER(@providerFilter)");
+    }
+    if (modelFilter) {
+      params.modelFilter = `%${modelFilter}%`;
+      unifiedFilters.push("LOWER(model) LIKE LOWER(@modelFilter)");
+      conditions.push("LOWER(model) LIKE LOWER(@modelFilter)");
+    }
+    apiKeyWhere = unifiedFilters.join(" AND ");
 
     const whereClause = conditions.length > 0 ? `WHERE ${conditions.join(" AND ")}` : "";
 
@@ -414,6 +457,8 @@ export async function GET(request: Request) {
     apiKeyIds.forEach((key, i) => {
       apiKeyParamEntries[`apiKey${i}`] = key;
     });
+    if (providerFilter) apiKeyParamEntries.providerFilter = `%${providerFilter}%`;
+    if (modelFilter) apiKeyParamEntries.modelFilter = `%${modelFilter}%`;
 
     const { unifiedSource, unifiedParams } = buildUnifiedSource({
       sinceIso: sinceIso ?? null,
@@ -464,6 +509,8 @@ export async function GET(request: Request) {
         heatmapParams[`apiKey${i}`] = key;
       });
     }
+    if (providerFilter) heatmapParams.providerFilter = `%${providerFilter}%`;
+    if (modelFilter) heatmapParams.modelFilter = `%${modelFilter}%`;
 
     const heatmapRows = getHeatmapRows(heatmapConditions, heatmapParams) as UsageRows;
 
@@ -530,7 +577,8 @@ export async function GET(request: Request) {
             )
           : 0,
       avgLatencyMs: Math.round(Number(summaryRow?.avgLatencyMs || 0)),
-      totalCost: 0,
+      totalCost: null as number | null,
+      costKnown: true,
       firstRequest: summaryRow?.firstRequest || "",
       lastRequest: summaryRow?.lastRequest || "",
       fallbackCount: Number(fallbackRow?.fallbacks || 0),
@@ -569,6 +617,7 @@ export async function GET(request: Request) {
     const allModels = new Set<string>();
 
     const dailyCostByDate = new Map<string, number>();
+    const dailyCostUnknownDates = new Set<string>();
     for (const row of dailyCostRows) {
       const date = toStringValue(row.date);
       if (!date) continue;
@@ -583,6 +632,18 @@ export async function GET(request: Request) {
         !includeFlatRateEstimates
       );
       dailyCostByDate.set(date, (dailyCostByDate.get(date) || 0) + cost);
+      if (
+        !hasUsageRowPricing(
+          row,
+          pricingByProvider,
+          PROVIDER_ID_TO_ALIAS,
+          normalizeModelName,
+          !includeFlatRateEstimates
+        )
+      ) {
+        dailyCostUnknownDates.add(date);
+        summary.costKnown = false;
+      }
 
       // Group tokens by model for the day
       const model = normalizeModelName(row.model as string);
@@ -599,7 +660,9 @@ export async function GET(request: Request) {
       promptTokens: Number(row.promptTokens),
       completionTokens: Number(row.completionTokens),
       totalTokens: Number(row.totalTokens),
-      cost: roundCost(dailyCostByDate.get(toStringValue(row.date)) || 0),
+      cost: dailyCostUnknownDates.has(toStringValue(row.date))
+        ? null
+        : roundCost(dailyCostByDate.get(toStringValue(row.date)) || 0),
     }));
 
     const activityMap: Record<string, number> = {};
@@ -637,6 +700,7 @@ export async function GET(request: Request) {
         successfulRequests: 0,
         lastUsed: "",
         cost: 0,
+        costKnown: true,
       };
       const requests = Number(row.requests) || 0;
       existing.requests = Number(existing.requests || 0) + requests;
@@ -652,6 +716,15 @@ export async function GET(request: Request) {
         existing.lastUsed = row.lastUsed;
       }
       existing.cost = Number(existing.cost || 0) + cost;
+      existing.costKnown =
+        Boolean(existing.costKnown) &&
+        hasUsageRowPricing(
+          row,
+          pricingByProvider,
+          PROVIDER_ID_TO_ALIAS,
+          normalizeModelName,
+          !includeFlatRateEstimates
+        );
       modelMap.set(key, existing);
     }
 
@@ -673,15 +746,17 @@ export async function GET(request: Request) {
             ? Number((Number(row.successfulRequests || 0) / Number(row.requests)) * 100).toFixed(2)
             : 0,
         lastUsed: row.lastUsed,
-        cost: roundCost(Number(row.cost || 0)),
+        cost: row.costKnown ? roundCost(Number(row.cost || 0)) : null,
+        costKnown: Boolean(row.costKnown),
       }))
       .sort((left, right) => Number(right.requests) - Number(left.requests))
       .slice(0, 50);
 
     const totalCost = Array.from(dailyCostByDate.values()).reduce((sum, cost) => sum + cost, 0);
-    summary.totalCost = roundCost(totalCost);
+    summary.totalCost = summary.costKnown ? roundCost(totalCost) : null;
 
     const providerCostByProvider = new Map<string, number>();
+    const providerCostUnknown = new Set<string>();
     for (const row of providerCostRows) {
       const provider = toStringValue(row.provider);
       if (!provider) continue;
@@ -694,11 +769,27 @@ export async function GET(request: Request) {
         !includeFlatRateEstimates
       );
       providerCostByProvider.set(provider, (providerCostByProvider.get(provider) || 0) + cost);
+      if (
+        !hasUsageRowPricing(
+          row,
+          pricingByProvider,
+          PROVIDER_ID_TO_ALIAS,
+          normalizeModelName,
+          !includeFlatRateEstimates
+        )
+      ) {
+        providerCostUnknown.add(provider);
+      }
     }
 
-    const byProvider = await buildByProviderRows(providerRows, providerCostByProvider);
+    const byProvider = await buildByProviderRows(
+      providerRows,
+      providerCostByProvider,
+      providerCostUnknown
+    );
 
     const accountCostByAccount = new Map<string, number>();
+    const accountCostUnknown = new Set<string>();
     for (const row of accountCostRows) {
       const accountKey = toStringValue(row.accountKey, "unknown");
       const cost = computeUsageRowCost(
@@ -710,6 +801,17 @@ export async function GET(request: Request) {
         !includeFlatRateEstimates
       );
       accountCostByAccount.set(accountKey, (accountCostByAccount.get(accountKey) || 0) + cost);
+      if (
+        !hasUsageRowPricing(
+          row,
+          pricingByProvider,
+          PROVIDER_ID_TO_ALIAS,
+          normalizeModelName,
+          !includeFlatRateEstimates
+        )
+      ) {
+        accountCostUnknown.add(accountKey);
+      }
     }
 
     const byAccount = accountRows.map((row) => ({
@@ -720,7 +822,10 @@ export async function GET(request: Request) {
       totalTokens: Number(row.totalTokens),
       avgLatencyMs: Math.round(Number(row.avgLatencyMs)),
       lastUsed: row.lastUsed,
-      cost: roundCost(accountCostByAccount.get(toStringValue(row.accountKey, "unknown")) || 0),
+      cost: accountCostUnknown.has(toStringValue(row.accountKey, "unknown"))
+        ? null
+        : roundCost(accountCostByAccount.get(toStringValue(row.accountKey, "unknown")) || 0),
+      costKnown: !accountCostUnknown.has(toStringValue(row.accountKey, "unknown")),
     }));
 
     const apiKeyMap = new Map<
@@ -735,6 +840,7 @@ export async function GET(request: Request) {
         completionTokens: number;
         totalTokens: number;
         cost: number;
+        costKnown: boolean;
       }
     >();
     for (const row of apiKeyRows) {
@@ -758,6 +864,7 @@ export async function GET(request: Request) {
         completionTokens: 0,
         totalTokens: 0,
         cost: 0,
+        costKnown: true,
       };
 
       existing.requests += Number(row.requests);
@@ -772,11 +879,20 @@ export async function GET(request: Request) {
         computeCostFromPricing,
         !includeFlatRateEstimates
       );
+      existing.costKnown =
+        Boolean(existing.costKnown) &&
+        hasUsageRowPricing(
+          row,
+          pricingByProvider,
+          PROVIDER_ID_TO_ALIAS,
+          normalizeModelName,
+          !includeFlatRateEstimates
+        );
       apiKeyMap.set(key, existing);
     }
     const byApiKey = Array.from(apiKeyMap.values())
-      .map((row) => ({ ...row, cost: roundCost(row.cost) }))
-      .sort((left, right) => right.cost - left.cost);
+      .map((row) => ({ ...row, cost: row.costKnown ? roundCost(row.cost) : null }))
+      .sort((left, right) => Number(right.cost || 0) - Number(left.cost || 0));
 
     const serviceTierMap = new Map<
       string,
@@ -788,6 +904,7 @@ export async function GET(request: Request) {
         completionTokens: number;
         totalTokens: number;
         cost: number;
+        costKnown: boolean;
         savings: number;
         usageSavingsTokens: number;
       }
@@ -802,6 +919,7 @@ export async function GET(request: Request) {
         completionTokens: 0,
         totalTokens: 0,
         cost: 0,
+        costKnown: true,
         savings: 0,
         usageSavingsTokens: 0,
       };
@@ -818,6 +936,15 @@ export async function GET(request: Request) {
         !includeFlatRateEstimates
       );
       existing.cost += actualCost;
+      existing.costKnown =
+        Boolean(existing.costKnown) &&
+        hasUsageRowPricing(
+          row,
+          pricingByProvider,
+          PROVIDER_ID_TO_ALIAS,
+          normalizeModelName,
+          !includeFlatRateEstimates
+        );
       if (serviceTier === "flex") {
         const standardCost = computeUsageRowStandardCost(
           row,
@@ -839,8 +966,9 @@ export async function GET(request: Request) {
     const byServiceTier = Array.from(serviceTierMap.values())
       .map((row) => ({
         ...row,
-        cost: roundCost(row.cost),
-        savings: roundCost(row.savings),
+        cost: row.costKnown ? roundCost(row.cost) : null,
+        costKnown: row.costKnown,
+        savings: row.costKnown ? roundCost(row.savings) : null,
         usageSavingsTokens: Math.round(row.usageSavingsTokens),
       }))
       .sort((left, right) => {
@@ -889,6 +1017,55 @@ export async function GET(request: Request) {
       .sort()
       .map((date) => ({ date, ...dailyByModelMap[date] }));
     const modelNames = Array.from(allModels);
+    const tokenUsageFilter = {
+      sinceIso: sinceIso ?? null,
+      untilIso,
+      apiKeyIds,
+      provider: providerFilter,
+      model: modelFilter,
+      rawCutoffDate,
+    };
+    const tokenSources = getTokenUsageSourceRows(tokenUsageFilter).map((row) => {
+      const lastUpdate = String(row.lastUpdate || "");
+      const ageMs = lastUpdate ? Date.now() - new Date(lastUpdate).getTime() : Infinity;
+      return {
+        ...row,
+        status: Number.isFinite(ageMs) && ageMs <= 24 * 60 * 60 * 1000 ? "recent" : "stale",
+      };
+    });
+    const monthlyTokenUsage = getTokenUsageMonthlyRows(tokenUsageFilter);
+    const dailyTokenUsage = getTokenUsageDailyRows(tokenUsageFilter);
+    const tokenUsageByProvider = getTokenUsageBreakdownRows(tokenUsageFilter, "provider");
+    const tokenUsageByModel = getTokenUsageBreakdownRows(tokenUsageFilter, "model");
+    const usageConnections = getUsageConnectionStatusRows().map((row) => {
+      const provider = String(row.provider || "");
+      const authType = String(row.authType || "").toLowerCase();
+      const sourceKind = isLocalProvider(provider)
+        ? "local"
+        : isFlatRateProvider(provider) ||
+            ((provider === "codex" || provider === "cx") && authType === "oauth")
+          ? "subscription"
+          : "cloud-api";
+      const lastUpdate =
+        [row.lastUsageAt, row.lastTested, row.lastUsedAt]
+          .filter((value): value is string => typeof value === "string" && value.length > 0)
+          .sort((left, right) => right.localeCompare(left))[0] || null;
+      return {
+        provider,
+        connectionName: row.connectionName || null,
+        sourceKind,
+        state:
+          Number(row.isActive) !== 1
+            ? "disabled"
+            : row.testStatus
+              ? String(row.testStatus)
+              : row.lastUsageAt
+                ? "capturing usage"
+                : "configured; no usage event yet",
+        lastUpdate,
+        lastUsageAt: row.lastUsageAt || null,
+      };
+    });
 
     const analytics = {
       summary,
@@ -907,6 +1084,12 @@ export async function GET(request: Request) {
       errorBreakdown,
       range,
       includesFlatRateEstimates: includeFlatRateEstimates,
+      tokenSources,
+      dailyTokenUsage,
+      monthlyTokenUsage,
+      tokenUsageByProvider,
+      tokenUsageByModel,
+      usageConnections,
     } as any;
 
     if (presetsParam) {
@@ -915,12 +1098,15 @@ export async function GET(request: Request) {
         .split(",")
         .map((preset) => preset.trim())
         .filter((preset) => allowedRanges.has(preset));
-      const presetSummaries: Record<string, { totalCost: number }> = {};
+      const presetSummaries: Record<string, { totalCost: number | null; costKnown: boolean }> = {};
 
       for (const presetRange of presetRanges) {
         if (presetRange === range) {
           presetSummaries[presetRange] = {
-            totalCost: Number(analytics.summary?.totalCost || 0),
+            totalCost: analytics.summary?.costKnown
+              ? Number(analytics.summary?.totalCost || 0)
+              : null,
+            costKnown: analytics.summary?.costKnown !== false,
           };
           continue;
         }
@@ -937,6 +1123,7 @@ export async function GET(request: Request) {
         const presetModelRows = getPresetCostModelRows(pSrc, pParams) as UsageRows;
 
         let presetTotalCost = 0;
+        let presetCostKnown = true;
         for (const row of presetModelRows) {
           presetTotalCost += computeUsageRowCost(
             row,
@@ -946,10 +1133,22 @@ export async function GET(request: Request) {
             computeCostFromPricing,
             !includeFlatRateEstimates
           );
+          if (
+            !hasUsageRowPricing(
+              row,
+              pricingByProvider,
+              PROVIDER_ID_TO_ALIAS,
+              normalizeModelName,
+              !includeFlatRateEstimates
+            )
+          ) {
+            presetCostKnown = false;
+          }
         }
 
         presetSummaries[presetRange] = {
-          totalCost: roundCost(presetTotalCost),
+          totalCost: presetCostKnown ? roundCost(presetTotalCost) : null,
+          costKnown: presetCostKnown,
         };
       }
 
@@ -966,5 +1165,209 @@ export async function GET(request: Request) {
     return NextResponse.json(buildErrorBody(500, message || "Failed to compute analytics"), {
       status: 500,
     });
+  }
+}
+
+function nullableTokenCount(value: unknown): number | null {
+  if (value === undefined || value === null || value === "") return null;
+  const number = Number(value);
+  return Number.isSafeInteger(number) && number >= 0 ? number : null;
+}
+
+/** Import only a normalized list of usage metadata; raw prompts are never accepted. */
+export async function POST(request: Request) {
+  const authError = await requireManagementAuth(request);
+  if (authError) return authError;
+
+  try {
+    const bodyText = await request.text();
+    if (bodyText.length > 10 * 1024 * 1024) {
+      return NextResponse.json({ error: "Usage import exceeds the 10 MB limit." }, { status: 413 });
+    }
+    const parsed: unknown = JSON.parse(bodyText);
+    const events = Array.isArray(parsed)
+      ? parsed
+      : parsed && typeof parsed === "object"
+        ? (parsed as { events?: unknown }).events
+        : null;
+    if (!Array.isArray(events) || events.length > 5000) {
+      return NextResponse.json(
+        { error: "Provide an events array containing at most 5,000 normalized records." },
+        { status: 400 }
+      );
+    }
+
+    let imported = 0;
+    let skipped = 0;
+    for (const [eventIndex, value] of events.entries()) {
+      if (!value || typeof value !== "object" || Array.isArray(value)) {
+        skipped++;
+        continue;
+      }
+      const event = value as Record<string, unknown>;
+      const timestamp = typeof event.timestamp === "string" ? event.timestamp : "";
+      const provider = typeof event.provider === "string" ? event.provider.trim() : "";
+      const model = typeof event.model === "string" ? event.model.trim() : "";
+      const timestampMs = Date.parse(timestamp);
+      if (
+        !provider ||
+        provider.length > 120 ||
+        !model ||
+        model.length > 240 ||
+        !timestamp ||
+        !Number.isFinite(timestampMs)
+      ) {
+        skipped++;
+        continue;
+      }
+
+      const tokenFields = [
+        "promptTokens",
+        "completionTokens",
+        "cacheReadTokens",
+        "cacheCreationTokens",
+        "reasoningTokens",
+        "noCacheTokens",
+      ];
+      const tokens: Record<string, number> = {};
+      let invalid = false;
+      const fieldMap: Record<string, string> = {
+        promptTokens: "prompt_tokens",
+        completionTokens: "completion_tokens",
+        cacheReadTokens: "cached_tokens",
+        cacheCreationTokens: "cache_creation_input_tokens",
+        reasoningTokens: "reasoning_tokens",
+        noCacheTokens: "no_cache_tokens",
+      };
+      for (const field of tokenFields) {
+        if (event[field] === undefined || event[field] === null || event[field] === "") continue;
+        const count = nullableTokenCount(event[field]);
+        if (count === null) {
+          invalid = true;
+          break;
+        }
+        const key = fieldMap[field];
+        tokens[key] = count;
+      }
+      if (invalid) {
+        skipped++;
+        continue;
+      }
+      const sourceReportedInput =
+        event.sourceReportedInput === undefined || event.sourceReportedInput === null
+          ? null
+          : nullableTokenCount(event.sourceReportedInput);
+      if (event.sourceReportedInput != null && sourceReportedInput === null) {
+        skipped++;
+        continue;
+      }
+
+      const validStatuses = new Set(["reported", "estimated", "unavailable", "legacy_unknown"]);
+      const inputStatus = String(
+        event.inputStatus || (tokens.prompt_tokens === undefined ? "unavailable" : "")
+      );
+      const outputStatus = String(
+        event.outputStatus || (tokens.completion_tokens === undefined ? "unavailable" : "")
+      );
+      if (
+        !validStatuses.has(inputStatus) ||
+        !validStatuses.has(outputStatus) ||
+        (inputStatus === "unavailable" && tokens.prompt_tokens !== undefined) ||
+        (outputStatus === "unavailable" && tokens.completion_tokens !== undefined) ||
+        (["reported", "estimated"].includes(inputStatus) && tokens.prompt_tokens === undefined) ||
+        (["reported", "estimated"].includes(outputStatus) && tokens.completion_tokens === undefined)
+      ) {
+        skipped++;
+        continue;
+      }
+      const allowedKinds = new Set(["local", "cloud-api", "subscription", "imported", "unknown"]);
+      const sourceKind = String(event.sourceKind || "unknown");
+      if (!allowedKinds.has(sourceKind)) {
+        skipped++;
+        continue;
+      }
+      const sourceLabel =
+        typeof event.sourceLabel === "string" ? event.sourceLabel.slice(0, 240) : "";
+      const externalEventId =
+        (typeof event.eventId === "string" || typeof event.eventId === "number") &&
+        String(event.eventId).length <= 1024
+          ? String(event.eventId)
+          : null;
+      const importEventId = createHash("sha256")
+        .update(
+          JSON.stringify(
+            externalEventId
+              ? ["source-event", provider, model, sourceLabel, timestamp, externalEventId]
+              : [
+                  "source-row",
+                  eventIndex,
+                  timestamp,
+                  provider,
+                  model,
+                  sourceKind,
+                  sourceLabel,
+                  inputStatus,
+                  outputStatus,
+                  tokens,
+                ]
+          )
+        )
+        .digest("hex");
+      const categoryStatuses = [
+        ["cacheReadStatus", "cacheReadTokens"],
+        ["cacheCreationStatus", "cacheCreationTokens"],
+        ["reasoningStatus", "reasoningTokens"],
+        ["noCacheStatus", "noCacheTokens"],
+      ] as const;
+      let invalidCategoryStatus = false;
+      const validCategoryStatuses = new Set(["reported", "unavailable", "legacy_unknown"]);
+      for (const [statusKey, tokenKey] of categoryStatuses) {
+        const statusValue = event[statusKey];
+        const tokenValue = event[tokenKey];
+        if (
+          (tokenValue !== undefined && tokenValue !== null && !statusValue) ||
+          (statusValue !== undefined && !validCategoryStatuses.has(String(statusValue))) ||
+          (statusValue === "unavailable" && tokens[fieldMap[tokenKey]] !== undefined) ||
+          (statusValue === "reported" && tokens[fieldMap[tokenKey]] === undefined)
+        ) {
+          invalidCategoryStatus = true;
+          break;
+        }
+      }
+      if (invalidCategoryStatus) {
+        skipped++;
+        continue;
+      }
+      const saved = await saveRequestUsage({
+        provider,
+        model,
+        timestamp: new Date(timestampMs).toISOString(),
+        tokens,
+        inputStatus: inputStatus as "reported" | "estimated" | "unavailable" | "legacy_unknown",
+        outputStatus: outputStatus as "reported" | "estimated" | "unavailable" | "legacy_unknown",
+        cacheReadStatus: event.cacheReadStatus as
+          "reported" | "unavailable" | "legacy_unknown" | undefined,
+        cacheCreationStatus: event.cacheCreationStatus as
+          "reported" | "unavailable" | "legacy_unknown" | undefined,
+        reasoningStatus: event.reasoningStatus as
+          "reported" | "unavailable" | "legacy_unknown" | undefined,
+        noCacheStatus: event.noCacheStatus as
+          "reported" | "unavailable" | "legacy_unknown" | undefined,
+        sourceReportedInput,
+        sourceKind: sourceKind as "local" | "cloud-api" | "subscription" | "imported" | "unknown",
+        sourceLabel: sourceLabel
+          ? `Imported JSON; prior source: ${sourceLabel}`
+          : "User-selected normalized JSON import",
+        importEventId,
+        ingestion: "import",
+        success: true,
+      });
+      if (saved) imported++;
+      else skipped++;
+    }
+    return NextResponse.json({ imported, skipped });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Invalid usage import file.";
+    return NextResponse.json({ error: message }, { status: 400 });
   }
 }

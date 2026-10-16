@@ -10,6 +10,7 @@ import path from "node:path";
 import type { RequestPipelinePayloads } from "@omniroute/open-sse/utils/requestLogger.ts";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import { getDbInstance } from "../db/core";
+import { isLocalProvider } from "@/shared/constants/providers";
 import { getRequestDetailLogByCallLogId } from "../db/detailedLogs";
 import { shouldPersistToDisk } from "./migrations";
 import { getCallLogApiKeyContext } from "./callLogApiKeyContext";
@@ -19,13 +20,18 @@ import {
   type ContinuationPipeline,
 } from "../db/responsesContinuationStore";
 import {
-  getLoggedInputTokens,
-  getLoggedOutputTokens,
+  getLoggedInputTokensOrNull,
+  getLoggedOutputTokensOrNull,
   getPromptCacheReadTokensOrNull,
   getPromptCacheCreationTokensOrNull,
   getReasoningTokensOrNull,
   getObservedReasoning,
+  getNoCacheTokens,
+  getSourceReportedInputTokens,
+  isInputUsageEstimated,
+  isOutputUsageEstimated,
 } from "./tokenAccounting";
+import { isFlatRateProvider } from "./flatRateProviders";
 import { isNoLog } from "../compliance/noLog";
 import {
   parseStoredPayload,
@@ -96,6 +102,16 @@ type CallLogSummaryRow = {
   tokens_cache_read: number | null;
   tokens_cache_creation: number | null;
   tokens_reasoning: number | null;
+  tokens_no_cache: number | null;
+  tokens_no_cache_status: string;
+  tokens_cache_read_status: string;
+  tokens_cache_creation_status: string;
+  tokens_reasoning_status: string;
+  tokens_in_status: string;
+  tokens_out_status: string;
+  tokens_in_source_reported: number | null;
+  usage_source_kind: string;
+  usage_source_label: string;
   tokens_compressed: number | null;
   cache_source: string | null;
   request_type: string | null;
@@ -213,11 +229,19 @@ function buildArtifact(
     account: string;
     connectionId: string | null;
     duration: number;
-    tokensIn: number;
-    tokensOut: number;
+    tokensIn: number | null;
+    tokensOut: number | null;
+    tokensInStatus: string;
+    tokensOutStatus: string;
+    tokensInSourceReported: number | null;
     tokensCacheRead: number | null;
     tokensCacheCreation: number | null;
     tokensReasoning: number | null;
+    tokensNoCache: number | null;
+    tokensNoCacheStatus: string;
+    tokensCacheReadStatus: string;
+    tokensCacheCreationStatus: string;
+    tokensReasoningStatus: string;
     tokensCompressed: number | null;
     requestType: string | null;
     sourceFormat: string | null;
@@ -234,7 +258,7 @@ function buildArtifact(
   pipelinePayloads: RequestPipelinePayloads | null
 ): CallLogArtifact {
   return {
-    schemaVersion: 5,
+    schemaVersion: 6,
     summary: {
       id: logEntry.id,
       timestamp: logEntry.timestamp,
@@ -250,9 +274,17 @@ function buildArtifact(
       tokens: {
         in: logEntry.tokensIn,
         out: logEntry.tokensOut,
+        inputStatus: logEntry.tokensInStatus,
+        outputStatus: logEntry.tokensOutStatus,
+        sourceReportedInput: logEntry.tokensInSourceReported,
         cacheRead: logEntry.tokensCacheRead,
         cacheWrite: logEntry.tokensCacheCreation,
         reasoning: logEntry.tokensReasoning,
+        cacheReadStatus: logEntry.tokensCacheReadStatus,
+        cacheCreationStatus: logEntry.tokensCacheCreationStatus,
+        reasoningStatus: logEntry.tokensReasoningStatus,
+        noCache: logEntry.tokensNoCache,
+        noCacheStatus: logEntry.tokensNoCacheStatus,
         compressed: logEntry.tokensCompressed,
       },
       requestType: logEntry.requestType,
@@ -387,15 +419,25 @@ function mapSummaryRow(row: CallLogSummaryRow) {
     requestedModel: applyNodePrefix(row.requested_model, provider, nodePrefix),
     provider,
     providerDisplay: resolveProviderDisplay(provider, nodeName, nodePrefix),
+    sourceKind: row.usage_source_kind,
+    sourceLabel: row.usage_source_label,
     account: row.resolved_account || row.account,
     connectionId: row.connection_id,
     duration: toNumber(row.duration),
     tokens: {
-      in: toNumber(row.tokens_in),
-      out: toNumber(row.tokens_out),
+      in: row.tokens_in != null ? toNumber(row.tokens_in) : null,
+      out: row.tokens_out != null ? toNumber(row.tokens_out) : null,
+      inputStatus: row.tokens_in_status,
+      outputStatus: row.tokens_out_status,
+      sourceReportedInput: row.tokens_in_source_reported,
       cacheRead: row.tokens_cache_read != null ? toNumber(row.tokens_cache_read) : null,
       cacheWrite: row.tokens_cache_creation != null ? toNumber(row.tokens_cache_creation) : null,
       reasoning: row.tokens_reasoning != null ? toNumber(row.tokens_reasoning) : null,
+      noCache: row.tokens_no_cache != null ? toNumber(row.tokens_no_cache) : null,
+      noCacheStatus: row.tokens_no_cache_status,
+      cacheReadStatus: row.tokens_cache_read_status,
+      cacheCreationStatus: row.tokens_cache_creation_status,
+      reasoningStatus: row.tokens_reasoning_status,
       compressed: row.tokens_compressed != null ? toNumber(row.tokens_compressed) : null,
     },
     cacheSource: row.cache_source || "upstream",
@@ -504,6 +546,15 @@ async function saveCallLogOperation(entry: any): Promise<void> {
 
     const account = await resolveAccountName(entry.connectionId || null);
     const rawProvider: string = entry.provider || "-";
+    const connectionAuthType = entry.connectionId
+      ? String(
+          (
+            db
+              .prepare("SELECT auth_type FROM provider_connections WHERE id = ?")
+              .get(entry.connectionId) as { auth_type?: string | null } | undefined
+          )?.auth_type || ""
+        ).toLowerCase()
+      : "";
     const rawRequestedModel: string | null = entry.requestedModel || null;
     let resolvedRequestedModel = rawRequestedModel;
     if (rawRequestedModel && isCompatibleProviderId(rawProvider)) {
@@ -530,11 +581,45 @@ async function saveCallLogOperation(entry: any): Promise<void> {
       account,
       connectionId: entry.connectionId || null,
       duration: entry.duration || 0,
-      tokensIn: toNumber(getLoggedInputTokens(entry.tokens)),
-      tokensOut: toNumber(getLoggedOutputTokens(entry.tokens)),
+      tokensIn: getLoggedInputTokensOrNull(entry.tokens),
+      tokensOut: getLoggedOutputTokensOrNull(entry.tokens),
+      tokensInStatus:
+        getLoggedInputTokensOrNull(entry.tokens) === null
+          ? "unavailable"
+          : isInputUsageEstimated(entry.tokens)
+            ? "estimated"
+            : "reported",
+      tokensOutStatus:
+        getLoggedOutputTokensOrNull(entry.tokens) === null
+          ? "unavailable"
+          : isOutputUsageEstimated(entry.tokens)
+            ? "estimated"
+            : "reported",
+      tokensInSourceReported: getSourceReportedInputTokens(entry.tokens),
+      usageSourceKind: isLocalProvider(rawProvider)
+        ? "local"
+        : isFlatRateProvider(rawProvider) ||
+            ((rawProvider === "codex" || rawProvider === "cx") && connectionAuthType === "oauth")
+          ? "subscription"
+          : rawProvider
+            ? "cloud-api"
+            : "unknown",
+      usageSourceLabel: isLocalProvider(rawProvider)
+        ? "Local model server response usage metadata"
+        : isFlatRateProvider(rawProvider) ||
+            ((rawProvider === "codex" || rawProvider === "cx") && connectionAuthType === "oauth")
+          ? "Subscription-backed response usage metadata"
+          : "Provider response usage metadata",
       tokensCacheRead: getPromptCacheReadTokensOrNull(entry.tokens),
       tokensCacheCreation: getPromptCacheCreationTokensOrNull(entry.tokens),
       tokensReasoning,
+      tokensNoCache: getNoCacheTokens(entry.tokens),
+      tokensNoCacheStatus: getNoCacheTokens(entry.tokens) === null ? "unavailable" : "reported",
+      tokensCacheReadStatus:
+        getPromptCacheReadTokensOrNull(entry.tokens) === null ? "unavailable" : "reported",
+      tokensCacheCreationStatus:
+        getPromptCacheCreationTokensOrNull(entry.tokens) === null ? "unavailable" : "reported",
+      tokensReasoningStatus: tokensReasoning === null ? "unavailable" : "reported",
       reasoningSource: reasoningObservation.source,
       reasoningChars: reasoningObservation.chars,
       tokensCompressed: entry.tokensCompressed != null ? toNumber(entry.tokensCompressed) : null,
@@ -609,7 +694,10 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         artifact_relpath, artifact_size_bytes, artifact_sha256,
         has_request_body, has_response_body, has_pipeline_details, request_summary,
         correlation_id, model_pinned, session_tag, response_id, error_type,
-        video_content_removed
+        video_content_removed, tokens_in_status, tokens_out_status,
+        tokens_in_source_reported, usage_source_kind, usage_source_label,
+        tokens_no_cache, tokens_no_cache_status, tokens_cache_read_status,
+        tokens_cache_creation_status, tokens_reasoning_status
       )
       VALUES (
         @id, @timestamp, @method, @path, @status, @model, @requestedModel, @provider,
@@ -621,7 +709,10 @@ async function saveCallLogOperation(entry: any): Promise<void> {
         @artifactRelPath, @artifactSizeBytes, @artifactSha256,
         @hasRequestBody, @hasResponseBody, @hasPipelineDetails, @requestSummary,
         @correlationId, @modelPinned, @sessionTag, @responseId, @errorType,
-        @videoContentRemoved
+        @videoContentRemoved, @tokensInStatus, @tokensOutStatus,
+        @tokensInSourceReported, @usageSourceKind, @usageSourceLabel,
+        @tokensNoCache, @tokensNoCacheStatus, @tokensCacheReadStatus,
+        @tokensCacheCreationStatus, @tokensReasoningStatus
       )
     `
     ).run({

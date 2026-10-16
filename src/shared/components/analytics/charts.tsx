@@ -508,7 +508,7 @@ export function ApiKeyTable({ byApiKey }) {
                   {fmt(row.totalTokens)}
                 </td>
                 <td className="px-4 py-2.5 text-right font-mono text-amber-500">
-                  {fmtCost(row.cost)}
+                  {row.costKnown === false ? "—" : `≈ ${fmtCost(row.cost)}`}
                 </td>
               </tr>
             ))}
@@ -720,6 +720,7 @@ export function ServiceTierBreakdown({ byServiceTier, summary }) {
   const tAnalytics = useTranslations("analytics");
   const data = useMemo(() => byServiceTier || [], [byServiceTier]);
   const totalRequests = Number(summary?.totalRequests || 0);
+  const totalCostKnown = summary?.costKnown !== false && summary?.totalCost != null;
   const totalCost = Number(summary?.totalCost || 0);
 
   if (!data.length) {
@@ -745,7 +746,9 @@ export function ServiceTierBreakdown({ byServiceTier, summary }) {
               ? ((Number(tier.requests || 0) / totalRequests) * 100).toFixed(1)
               : "0";
           const costPct =
-            totalCost > 0 ? ((Number(tier.cost || 0) / totalCost) * 100).toFixed(1) : "0";
+            totalCostKnown && totalCost > 0
+              ? ((Number(tier.cost || 0) / totalCost) * 100).toFixed(1)
+              : null;
           const usageSavings = Number(tier.usageSavingsTokens || 0);
           const costSavings = Number(tier.savings || 0);
           const usageSavingsText =
@@ -757,9 +760,11 @@ export function ServiceTierBreakdown({ byServiceTier, summary }) {
                 )}`
               : "";
           const costDetailText =
-            isFlex && costSavings > 0
-              ? `${fmtCost(costSavings)} ${translateCostText(t, "serviceTierCostSaved", "saved")}`
-              : `${costPct}% ${translateCostText(t, "serviceTierCostShareSuffix", "of cost")}`;
+            tier.costKnown === false || !totalCostKnown || costPct === null
+              ? "Unavailable without a matching token price"
+              : isFlex && costSavings > 0
+                ? `≈ ${fmtCost(costSavings)} ${translateCostText(t, "serviceTierCostSaved", "saved")}`
+                : `${costPct}% ${translateCostText(t, "serviceTierCostShareSuffix", "of cost")}`;
 
           return (
             <div key={tier.serviceTier} className="p-4 flex flex-col gap-3">
@@ -789,7 +794,7 @@ export function ServiceTierBreakdown({ byServiceTier, summary }) {
                       tier.serviceTier
                     )}`}
                   >
-                    {fmtCost(tier.cost)}
+                    {tier.costKnown === false ? "—" : `≈ ${fmtCost(tier.cost)}`}
                   </div>
                   <div className="text-xs text-text-muted">{costDetailText}</div>
                 </div>
@@ -974,7 +979,7 @@ export function ProviderTable({ byProvider }) {
                     {fmt(p.totalTokens)}
                   </td>
                   <td className="px-4 py-2.5 text-right font-mono text-amber-500">
-                    {fmtCost(p.cost)}
+                    {p.costKnown === false ? "—" : `≈ ${fmtCost(p.cost)}`}
                   </td>
                   <td className="px-4 py-2.5 text-right">
                     <div className="flex items-center gap-2 justify-end">

@@ -69,6 +69,14 @@ function getLogTotalTokens(log) {
   return (log?.tokens?.in || 0) + (log?.tokens?.out || 0);
 }
 
+function formatLoggedTokenCount(value, status) {
+  const rendered = value == null ? null : value.toLocaleString();
+  if (status === "reported") return rendered == null ? "Unavailable" : `${rendered} reported`;
+  if (status === "estimated") return rendered == null ? "Unavailable" : `≈${rendered} estimated`;
+  if (status === "unavailable") return "Unavailable";
+  return "Legacy count unverified";
+}
+
 function getLogTps(log): number {
   const tokensOut = log?.tokens?.out || 0;
   const durationMs = log?.duration || 0;
@@ -1561,15 +1569,33 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                             ) : (
                               <>
                                 <span className="text-text-muted">TI:</span>{" "}
-                                <span className="text-primary">
-                                  {log.tokens?.in?.toLocaleString() || 0}
+                                <span
+                                  className="text-primary"
+                                  title={log.sourceLabel || "Usage source unavailable"}
+                                >
+                                  {formatLoggedTokenCount(log.tokens?.in, log.tokens?.inputStatus)}
                                 </span>
+                                {log.tokens?.sourceReportedInput != null && (
+                                  <span
+                                    className="ml-1 text-text-muted"
+                                    title="Original prompt count reported by the provider before OmniRoute applied its plausibility estimate"
+                                  >
+                                    (provider reported{" "}
+                                    {log.tokens.sourceReportedInput.toLocaleString()})
+                                  </span>
+                                )}
                                 <span className="mx-1 text-border">|</span>
                                 <span className="text-text-muted">TO:</span>{" "}
-                                <span className="text-emerald-700 dark:text-emerald-400">
-                                  {log.tokens?.out?.toLocaleString() || 0}
+                                <span
+                                  className="text-emerald-700 dark:text-emerald-400"
+                                  title={log.sourceLabel || "Usage source unavailable"}
+                                >
+                                  {formatLoggedTokenCount(
+                                    log.tokens?.out,
+                                    log.tokens?.outputStatus
+                                  )}
                                 </span>
-                                {log.tokens?.cacheRead != null && log.tokens.cacheRead > 0 && (
+                                {log.tokens?.cacheRead != null && (
                                   <>
                                     <span className="mx-1 text-border">|</span>
                                     <span className="text-text-muted">CR:</span>{" "}
@@ -1577,12 +1603,23 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                                       className="text-sky-700 dark:text-sky-400"
                                       title={tCache("cachedTokensCol")}
                                     >
-                                      {log.tokens.cacheRead.toLocaleString()} (
-                                      {formatCachePercentage(log.tokens.in, log.tokens.cacheRead)}%)
+                                      {log.tokens.cacheRead.toLocaleString()}{" "}
+                                      {log.tokens.cacheReadStatus || "legacy unknown"}
+                                      {log.tokens.inputStatus === "reported" && (
+                                        <>
+                                          {" "}
+                                          (
+                                          {formatCachePercentage(
+                                            log.tokens.in ?? 0,
+                                            log.tokens.cacheRead
+                                          )}
+                                          %)
+                                        </>
+                                      )}
                                     </span>
                                   </>
                                 )}
-                                {log.tokens?.cacheWrite != null && log.tokens.cacheWrite > 0 && (
+                                {log.tokens?.cacheWrite != null && (
                                   <>
                                     <span className="mx-1 text-border">|</span>
                                     <span className="text-text-muted">CW:</span>{" "}
@@ -1590,7 +1627,34 @@ const RequestLoggerV2 = forwardRef<RequestLoggerV2Handle, { initialSelectedId?: 
                                       className="text-amber-700 dark:text-amber-400"
                                       title={tCache("cacheCreation")}
                                     >
-                                      {log.tokens.cacheWrite.toLocaleString()}
+                                      {log.tokens.cacheWrite.toLocaleString()}{" "}
+                                      {log.tokens.cacheCreationStatus || "legacy unknown"}
+                                    </span>
+                                  </>
+                                )}
+                                {log.tokens?.noCache != null && (
+                                  <>
+                                    <span className="mx-1 text-border">|</span>
+                                    <span className="text-text-muted">NC:</span>{" "}
+                                    <span
+                                      className="text-cyan-700 dark:text-cyan-400"
+                                      title="Provider-reported non-cached input tokens; included in the input total"
+                                    >
+                                      {log.tokens.noCache.toLocaleString()}{" "}
+                                      {log.tokens.noCacheStatus || "legacy unknown"}
+                                    </span>
+                                  </>
+                                )}
+                                {log.tokens?.reasoning != null && (
+                                  <>
+                                    <span className="mx-1 text-border">|</span>
+                                    <span className="text-text-muted">R:</span>{" "}
+                                    <span
+                                      className="text-violet-700 dark:text-violet-400"
+                                      title="Reasoning tokens"
+                                    >
+                                      {log.tokens.reasoning.toLocaleString()}{" "}
+                                      {log.tokens.reasoningStatus || "legacy unknown"}
                                     </span>
                                   </>
                                 )}

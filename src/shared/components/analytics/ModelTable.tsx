@@ -147,7 +147,7 @@ export function ModelTable({ byModel, summary }: ModelTableProps) {
                   {fmt(m.totalTokens)}
                 </td>
                 <td className="px-4 py-2.5 text-right font-mono text-amber-500">
-                  {fmtCost(m.cost)}
+                  {m.costKnown === false ? "—" : `≈ ${fmtCost(m.cost)}`}
                 </td>
                 <td className="px-4 py-2.5 text-right">
                   <div className="flex items-center gap-2 justify-end">

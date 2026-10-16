@@ -149,15 +149,28 @@ Highlights:
 
 ## Zero-config Secret Bootstrap
 
-On first launch, the main process auto-generates and persists missing secrets:
+On first launch, the main process auto-generates missing app secrets. Provider credentials in
+SQLite are encrypted with `STORAGE_ENCRYPTION_KEY`; Electron protects that database key with
+`safeStorage` and persists only the OS-encrypted value in `storage-encryption-key.safe`:
 
-| Secret                   | Source                                                                              |
-| ------------------------ | ----------------------------------------------------------------------------------- |
-| `JWT_SECRET`             | `crypto.randomBytes(64).toString("hex")`                                            |
-| `STORAGE_ENCRYPTION_KEY` | `crypto.randomBytes(32).toString("hex")` (refuses if encrypted creds already exist) |
-| `API_KEY_SECRET`         | `crypto.randomBytes(32).toString("hex")`                                            |
+| Secret                   | Source                                                                          |
+| ------------------------ | ------------------------------------------------------------------------------- |
+| `JWT_SECRET`             | `crypto.randomBytes(64).toString("hex")`                                        |
+| `STORAGE_ENCRYPTION_KEY` | Generated in memory or supplied by environment; persisted with OS `safeStorage` |
+| `API_KEY_SECRET`         | `crypto.randomBytes(32).toString("hex")`                                        |
 
-Persisted to `<DATA_DIR>/server.env`. `DATA_DIR` resolves to:
+`JWT_SECRET` and `API_KEY_SECRET` are persisted to `<DATA_DIR>/server.env` with owner-only file
+permissions. The encryption key is not written to that file. A legacy plaintext
+`STORAGE_ENCRYPTION_KEY` in `server.env` is migrated to `safeStorage` and removed after a
+successful migration. If encrypted provider credentials exist but the encryption key cannot be
+recovered, Electron refuses to generate a replacement key.
+
+On Linux, Electron must have an unlocked desktop Secret Service/keyring. The app rejects the
+`basic_text` fallback because it does not protect the key. If no secure backend is available, the
+desktop shows a setup page; install/unlock the keyring, then quit and reopen OmniRoute. macOS uses
+Keychain and Windows uses DPAPI through Electron `safeStorage`.
+
+`DATA_DIR` resolves to:
 
 - Windows: `%APPDATA%\omniroute`
 - Linux: `$XDG_CONFIG_HOME/omniroute` or `~/.omniroute`

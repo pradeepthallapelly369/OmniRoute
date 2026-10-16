@@ -19,7 +19,7 @@
  */
 
 import { randomBytes, createDecipheriv, scryptSync, createHash } from "node:crypto";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { homedir } from "node:os";
 import { join, resolve } from "node:path";
@@ -88,7 +88,7 @@ function isLikelyBrokenNativeBinding(error) {
   return message.includes("is not a function") || message.includes("is not a constructor");
 }
 
-function hasEncryptedCredentials(dataDir) {
+export function hasEncryptedCredentials(dataDir) {
   const dbPath = join(dataDir, "storage.sqlite");
   if (!existsSync(dbPath)) return false;
 
@@ -183,7 +183,12 @@ function writeEnvFile(filePath, env) {
     ...Object.entries(env).map(([k, v]) => `${k}=${v}`),
     "",
   ];
-  writeFileSync(filePath, lines.join("\n"), "utf8");
+  writeFileSync(filePath, lines.join("\n"), { encoding: "utf8", mode: 0o600 });
+  try {
+    chmodSync(filePath, 0o600);
+  } catch {
+    // Best effort on platforms where POSIX file modes are unavailable.
+  }
 }
 
 // ── Main bootstrap function ──────────────────────────────────────────────────

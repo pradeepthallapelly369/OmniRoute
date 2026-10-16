@@ -124,6 +124,7 @@ export function fmtFull(n: number | null | undefined) {
  * @returns {string}
  */
 export function formatCost(usd: number | null | undefined): string {
+  if (usd === null || usd === undefined) return "—";
   const value = Number(usd || 0);
   if (!Number.isFinite(value) || value === 0) return "$0.00";
   if (value < 0.01) return `$${value.toFixed(6)}`;

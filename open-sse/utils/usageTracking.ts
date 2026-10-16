@@ -475,18 +475,9 @@ function getReportedInputTokens(usage: UsageLike, format: string): number {
   return tokenNumber(usage.prompt_tokens ?? usage.input_tokens);
 }
 
-function clearCachedTokenDetail<T extends UsageTokenDetail | null | undefined>(value: T): T {
-  if (!value || typeof value !== "object" || Array.isArray(value)) return value;
-  const result = { ...value };
-  if (result.cached_tokens !== undefined) result.cached_tokens = 0;
-  if (result.cache_creation_tokens !== undefined) result.cache_creation_tokens = 0;
-  if (result.cache_write_tokens !== undefined) result.cache_write_tokens = 0;
-  return result;
-}
-
 /**
- * Replace only physically implausible provider input/cache usage with the local
- * request estimate. Valid usage is returned by reference and remains untouched.
+ * Replace only physically implausible provider input usage with the local
+ * request estimate. Cache and reasoning fields remain the provider's values.
  */
 export function sanitizeProviderUsageForRequest(
   usage: UsageLike | null | undefined,
@@ -512,13 +503,30 @@ export function sanitizeProviderUsageForRequest(
 
   const estimatedInput = Math.max(1, estimateInputTokens(body));
   const result = { ...usage };
+  result.estimated = true;
+  Object.defineProperty(result, Symbol.for("omniroute.usage.input-estimated"), {
+    value: true,
+    enumerable: false,
+  });
+  const hasReportedInput =
+    format === FORMATS.CLAUDE
+      ? usage.input_tokens !== undefined ||
+        usage.cache_read_input_tokens !== undefined ||
+        usage.cache_creation_input_tokens !== undefined
+      : format === FORMATS.GEMINI
+        ? usage.promptTokenCount !== undefined
+        : format === FORMATS.OPENAI_RESPONSES
+          ? usage.input_tokens !== undefined || usage.prompt_tokens !== undefined
+          : usage.prompt_tokens !== undefined || usage.input_tokens !== undefined;
+  if (hasReportedInput) {
+    Object.defineProperty(result, Symbol.for("omniroute.usage.source-reported-input"), {
+      value: reportedInput,
+      enumerable: false,
+    });
+  }
 
   if (format === FORMATS.CLAUDE) {
     result.input_tokens = estimatedInput;
-    result.prompt_tokens_details = clearCachedTokenDetail(result.prompt_tokens_details);
-    result.input_tokens_details = clearCachedTokenDetail(result.input_tokens_details);
-    result.cache_read_input_tokens = 0;
-    result.cache_creation_input_tokens = 0;
     return result;
   }
 
@@ -526,7 +534,6 @@ export function sanitizeProviderUsageForRequest(
     const output =
       tokenNumber(result.candidatesTokenCount) + tokenNumber(result.thoughtsTokenCount);
     result.promptTokenCount = estimatedInput;
-    result.cachedContentTokenCount = 0;
     if (result.totalTokenCount !== undefined) {
       result.totalTokenCount = estimatedInput + output;
     }
@@ -535,10 +542,6 @@ export function sanitizeProviderUsageForRequest(
 
   if (format === FORMATS.OPENAI_RESPONSES) {
     result.input_tokens = estimatedInput;
-    result.prompt_tokens_details = clearCachedTokenDetail(result.prompt_tokens_details);
-    result.input_tokens_details = clearCachedTokenDetail(result.input_tokens_details);
-    result.cache_read_input_tokens = 0;
-    result.cache_creation_input_tokens = 0;
     if (result.total_tokens !== undefined) {
       result.total_tokens = estimatedInput + tokenNumber(result.output_tokens);
     }
@@ -546,10 +549,6 @@ export function sanitizeProviderUsageForRequest(
   }
 
   result.prompt_tokens = estimatedInput;
-  result.cached_tokens = 0;
-  result.cache_read_input_tokens = 0;
-  result.cache_creation_input_tokens = 0;
-  result.prompt_tokens_details = clearCachedTokenDetail(result.prompt_tokens_details);
   if (result.total_tokens !== undefined) {
     result.total_tokens = estimatedInput + tokenNumber(result.completion_tokens);
   }
@@ -658,12 +657,20 @@ export function normalizeUsage(usage: UsageLike | null | undefined) {
 // usage field, cost or budget — it only lets the call-log sink tell estimated usage apart
 // after extraction rebuilt the object without the provider's `estimated` flag.
 const ESTIMATED_USAGE_MARKER = Symbol.for("omniroute.usage.estimated");
+const INPUT_ESTIMATED_MARKER = Symbol.for("omniroute.usage.input-estimated");
+const SOURCE_REPORTED_INPUT_MARKER = Symbol.for("omniroute.usage.source-reported-input");
 
 export function carryEstimatedUsageMarker<T>(source: unknown, rebuilt: T): T {
   const estimated =
     !!source && typeof source === "object" && (source as UsageLike).estimated === true;
   if (estimated && rebuilt && typeof rebuilt === "object") {
     Object.defineProperty(rebuilt, ESTIMATED_USAGE_MARKER, { value: true, enumerable: false });
+  }
+  if (source && rebuilt && typeof source === "object" && typeof rebuilt === "object") {
+    for (const marker of [INPUT_ESTIMATED_MARKER, SOURCE_REPORTED_INPUT_MARKER]) {
+      const value = Reflect.get(source, marker);
+      if (value !== undefined) Object.defineProperty(rebuilt, marker, { value, enumerable: false });
+    }
   }
   return rebuilt;
 }
@@ -764,35 +771,72 @@ export function extractUsage(chunk: UsagePayloadLike | null | undefined) {
   // extractUsageFromResponse in usageExtractor.ts for non-streaming).
   if (chunk.type === "message_start" && chunk.message?.usage) {
     const u = chunk.message.usage;
-    const inputTokens = u.input_tokens || u.prompt_tokens || 0;
-    const cacheRead = u.cache_read_input_tokens || 0;
-    const cacheCreation = u.cache_creation_input_tokens || 0;
-    if (inputTokens > 0 || cacheRead > 0 || cacheCreation > 0) {
-      return normalizeUsage({
-        prompt_tokens: inputTokens + cacheRead + cacheCreation,
-        completion_tokens: u.output_tokens || u.completion_tokens || 0,
-        input_tokens: inputTokens + cacheRead + cacheCreation,
-        output_tokens: u.output_tokens || u.completion_tokens || 0,
-        cache_read_input_tokens: u.cache_read_input_tokens,
-        cache_creation_input_tokens: u.cache_creation_input_tokens,
-      });
+    const inputTokens = u.input_tokens ?? u.prompt_tokens;
+    const cacheRead = u.cache_read_input_tokens;
+    const cacheCreation = u.cache_creation_input_tokens;
+    if (inputTokens !== undefined || cacheRead !== undefined || cacheCreation !== undefined) {
+      const totalInput =
+        Reflect.get(u, INPUT_ESTIMATED_MARKER) === true
+          ? typeof inputTokens === "number"
+            ? inputTokens
+            : 0
+          : (typeof inputTokens === "number" ? inputTokens : 0) +
+            (typeof cacheRead === "number" ? cacheRead : 0) +
+            (typeof cacheCreation === "number" ? cacheCreation : 0);
+      return carryEstimatedUsageMarker(
+        u,
+        normalizeUsage({
+          prompt_tokens: totalInput,
+          input_tokens: totalInput,
+          ...(u.output_tokens !== undefined || u.completion_tokens !== undefined
+            ? { completion_tokens: u.output_tokens ?? u.completion_tokens }
+            : {}),
+          ...(u.output_tokens !== undefined || u.completion_tokens !== undefined
+            ? { output_tokens: u.output_tokens ?? u.completion_tokens }
+            : {}),
+          ...(cacheRead !== undefined ? { cache_read_input_tokens: cacheRead } : {}),
+          ...(cacheCreation !== undefined ? { cache_creation_input_tokens: cacheCreation } : {}),
+        })
+      );
     }
   }
 
   // Claude format (message_delta event) — typically carries OUTPUT tokens
   if (chunk.type === "message_delta" && chunk.usage && typeof chunk.usage === "object") {
-    const deltaInput = chunk.usage.input_tokens || 0;
-    const deltaCacheRead = chunk.usage.cache_read_input_tokens || 0;
-    const deltaCacheCreation = chunk.usage.cache_creation_input_tokens || 0;
-    return normalizeUsage({
-      prompt_tokens: deltaInput + deltaCacheRead + deltaCacheCreation,
-      completion_tokens: chunk.usage.output_tokens || 0,
-      input_tokens: deltaInput + deltaCacheRead + deltaCacheCreation,
-      output_tokens: chunk.usage.output_tokens || 0,
-      cache_read_input_tokens: chunk.usage.cache_read_input_tokens,
-      cache_creation_input_tokens: chunk.usage.cache_creation_input_tokens,
-      reasoning_tokens: chunk.usage.output_tokens_details?.thinking_tokens,
-    });
+    const deltaInput = chunk.usage.input_tokens;
+    const deltaCacheRead = chunk.usage.cache_read_input_tokens;
+    const deltaCacheCreation = chunk.usage.cache_creation_input_tokens;
+    const inputWasEstimated = Reflect.get(chunk.usage, INPUT_ESTIMATED_MARKER) === true;
+    const totalInput = inputWasEstimated
+      ? typeof deltaInput === "number"
+        ? deltaInput
+        : 0
+      : (typeof deltaInput === "number" ? deltaInput : 0) +
+        (typeof deltaCacheRead === "number" ? deltaCacheRead : 0) +
+        (typeof deltaCacheCreation === "number" ? deltaCacheCreation : 0);
+    return carryEstimatedUsageMarker(
+      chunk.usage,
+      normalizeUsage({
+        ...(deltaInput !== undefined ||
+        deltaCacheRead !== undefined ||
+        deltaCacheCreation !== undefined
+          ? { prompt_tokens: totalInput, input_tokens: totalInput }
+          : {}),
+        ...(chunk.usage.output_tokens !== undefined
+          ? {
+              completion_tokens: chunk.usage.output_tokens,
+              output_tokens: chunk.usage.output_tokens,
+            }
+          : {}),
+        ...(deltaCacheRead !== undefined ? { cache_read_input_tokens: deltaCacheRead } : {}),
+        ...(deltaCacheCreation !== undefined
+          ? { cache_creation_input_tokens: deltaCacheCreation }
+          : {}),
+        ...(chunk.usage.output_tokens_details?.thinking_tokens !== undefined
+          ? { reasoning_tokens: chunk.usage.output_tokens_details.thinking_tokens }
+          : {}),
+      })
+    );
   }
 
   // OpenAI Responses API format (response.completed or response.done)
@@ -802,30 +846,44 @@ export function extractUsage(chunk: UsagePayloadLike | null | undefined) {
     typeof chunk.response.usage === "object"
   ) {
     const usage = chunk.response.usage;
-    return normalizeUsage({
-      prompt_tokens: usage.input_tokens || usage.prompt_tokens || 0,
-      completion_tokens: usage.output_tokens || usage.completion_tokens || 0,
-      cached_tokens:
-        usage.input_tokens_details?.cached_tokens ??
-        usage.prompt_tokens_details?.cached_tokens ??
-        usage.cache_read_input_tokens,
-      cache_creation_input_tokens: pickCacheCreationTokens(usage),
-      reasoning_tokens:
-        usage.output_tokens_details?.reasoning_tokens ??
-        usage.completion_tokens_details?.reasoning_tokens ??
-        usage.reasoning_tokens,
-    });
+    return carryEstimatedUsageMarker(
+      usage,
+      normalizeUsage({
+        ...(usage.input_tokens !== undefined || usage.prompt_tokens !== undefined
+          ? { prompt_tokens: usage.input_tokens ?? usage.prompt_tokens }
+          : {}),
+        ...(usage.output_tokens !== undefined || usage.completion_tokens !== undefined
+          ? { completion_tokens: usage.output_tokens ?? usage.completion_tokens }
+          : {}),
+        cached_tokens:
+          usage.input_tokens_details?.cached_tokens ??
+          usage.prompt_tokens_details?.cached_tokens ??
+          usage.cache_read_input_tokens,
+        cache_creation_input_tokens: pickCacheCreationTokens(usage),
+        reasoning_tokens:
+          usage.output_tokens_details?.reasoning_tokens ??
+          usage.completion_tokens_details?.reasoning_tokens ??
+          usage.reasoning_tokens,
+      })
+    );
   }
 
   // OpenAI format
   if (
     chunk.usage &&
     typeof chunk.usage === "object" &&
-    (chunk.usage.prompt_tokens !== undefined || chunk.usage.input_tokens !== undefined)
+    (chunk.usage.prompt_tokens !== undefined ||
+      chunk.usage.input_tokens !== undefined ||
+      chunk.usage.completion_tokens !== undefined ||
+      chunk.usage.output_tokens !== undefined)
   ) {
     const normalized = normalizeUsage({
-      prompt_tokens: chunk.usage.prompt_tokens ?? chunk.usage.input_tokens ?? 0,
-      completion_tokens: chunk.usage.completion_tokens ?? chunk.usage.output_tokens ?? 0,
+      ...(chunk.usage.prompt_tokens !== undefined || chunk.usage.input_tokens !== undefined
+        ? { prompt_tokens: chunk.usage.prompt_tokens ?? chunk.usage.input_tokens }
+        : {}),
+      ...(chunk.usage.completion_tokens !== undefined || chunk.usage.output_tokens !== undefined
+        ? { completion_tokens: chunk.usage.completion_tokens ?? chunk.usage.output_tokens }
+        : {}),
       cached_tokens:
         chunk.usage.prompt_tokens_details?.cached_tokens ??
         chunk.usage.input_tokens_details?.cached_tokens ??
@@ -853,24 +911,35 @@ export function extractUsage(chunk: UsagePayloadLike | null | undefined) {
     // Gemini reports thoughts outside candidates. Fold them into completion so
     // every provider keeps reasoning as a subset of completion tokens.
     const thoughts = usageMeta.thoughtsTokenCount || 0;
-    return normalizeUsage({
-      prompt_tokens: usageMeta.promptTokenCount || 0,
-      completion_tokens: (usageMeta.candidatesTokenCount || 0) + thoughts,
-      total_tokens: usageMeta.totalTokenCount,
-      cached_tokens: usageMeta.cachedContentTokenCount,
-      reasoning_tokens: thoughts,
-    });
+    return carryEstimatedUsageMarker(
+      usageMeta,
+      normalizeUsage({
+        ...(usageMeta.promptTokenCount !== undefined
+          ? { prompt_tokens: usageMeta.promptTokenCount }
+          : {}),
+        ...(usageMeta.candidatesTokenCount !== undefined ||
+        usageMeta.thoughtsTokenCount !== undefined
+          ? {
+              completion_tokens:
+                (usageMeta.candidatesTokenCount || 0) + (usageMeta.thoughtsTokenCount || 0),
+            }
+          : {}),
+        total_tokens: usageMeta.totalTokenCount,
+        cached_tokens: usageMeta.cachedContentTokenCount,
+        reasoning_tokens: thoughts,
+      })
+    );
   }
 
   // Ollama NDJSON format (raw from provider, before translation)
   // Ollama sends: { "model": "...", "done": true, "prompt_eval_count": N, "eval_count": M }
   if (chunk.done === true && typeof chunk.prompt_eval_count === "number") {
     const promptEvalCount = chunk.prompt_eval_count || 0;
-    const evalCount = chunk.eval_count || 0;
+    const evalCount = chunk.eval_count;
     return normalizeUsage({
       prompt_tokens: promptEvalCount,
-      completion_tokens: evalCount,
-      total_tokens: promptEvalCount + evalCount,
+      ...(evalCount !== undefined ? { completion_tokens: evalCount } : {}),
+      ...(evalCount !== undefined ? { total_tokens: promptEvalCount + evalCount } : {}),
     });
   }
 

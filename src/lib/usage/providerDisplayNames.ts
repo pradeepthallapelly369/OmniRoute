@@ -28,9 +28,7 @@ function getProviderDisplayName(
   const rawProvider = toStringValue(provider, "unknown");
   // Configured node name wins; static catalog covers built-ins (e.g. codex →
   // "OpenAI Codex") the nodes table doesn't know about; raw id is the last resort.
-  return (
-    providerDisplayNames.get(rawProvider) || getProviderById(rawProvider)?.name || rawProvider
-  );
+  return providerDisplayNames.get(rawProvider) || getProviderById(rawProvider)?.name || rawProvider;
 }
 
 async function getProviderDisplayNames(): Promise<Map<string, string>> {
@@ -60,7 +58,8 @@ export interface ByProviderRow {
   totalTokens: number;
   avgLatencyMs: number;
   successRatePct: number | string;
-  cost: number;
+  cost: number | null;
+  costKnown: boolean;
 }
 
 /**
@@ -69,7 +68,8 @@ export interface ByProviderRow {
  */
 export async function buildByProviderRows(
   providerRows: Array<Record<string, unknown>>,
-  providerCostByProvider: Map<string, number>
+  providerCostByProvider: Map<string, number>,
+  providerCostUnknown: Set<string> = new Set()
 ): Promise<ByProviderRow[]> {
   const providerDisplayNames = await getProviderDisplayNames();
   return providerRows.map((row) => ({
@@ -83,6 +83,9 @@ export async function buildByProviderRows(
       Number(row.requests) > 0
         ? Number((Number(row.successfulRequests) / Number(row.requests)) * 100).toFixed(2)
         : 0,
-    cost: roundCost(providerCostByProvider.get(toStringValue(row.provider)) || 0),
+    costKnown: !providerCostUnknown.has(toStringValue(row.provider)),
+    cost: providerCostUnknown.has(toStringValue(row.provider))
+      ? null
+      : roundCost(providerCostByProvider.get(toStringValue(row.provider)) || 0),
   }));
 }

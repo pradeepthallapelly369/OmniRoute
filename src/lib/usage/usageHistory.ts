@@ -8,7 +8,8 @@
  */
 
 import { getDbInstance } from "../db/core";
-import { resolveProviderId } from "@/shared/constants/providers";
+import { isLocalProvider, resolveProviderId } from "@/shared/constants/providers";
+import { isFlatRateProvider } from "./flatRateProviders";
 import { protectPayloadForLog } from "../logPayloads";
 import { sanitizeErrorMessage } from "@omniroute/open-sse/utils/errorSanitization.ts";
 import {
@@ -36,11 +37,15 @@ import {
 import { shouldPersistToDisk } from "./migrations";
 import { emitUsageRecorded } from "./usageEvents";
 import {
-  getLoggedInputTokens,
-  getLoggedOutputTokens,
-  getPromptCacheCreationTokens,
-  getPromptCacheReadTokens,
-  getReasoningTokens,
+  getLoggedInputTokensOrNull,
+  getLoggedOutputTokensOrNull,
+  getPromptCacheCreationTokensOrNull,
+  getPromptCacheReadTokensOrNull,
+  getReasoningTokensOrNull,
+  getNoCacheTokens,
+  getSourceReportedInputTokens,
+  isInputUsageEstimated,
+  isOutputUsageEstimated,
 } from "./tokenAccounting";
 
 export type PendingRequestMetadata = {
@@ -367,7 +372,10 @@ export function trackPendingRequest(
       pendingRequests.details[connectionId][modelKey].push(newDetail);
       pendingById.set(newDetail.id, newDetail);
       if (normalizedMetadata.correlationId) {
-        pendingIdByCorrelation.set(normalizedMetadata.correlationId, { id: newDetail.id, touchedAt: now });
+        pendingIdByCorrelation.set(normalizedMetadata.correlationId, {
+          id: newDetail.id,
+          touchedAt: now,
+        });
       }
       return newDetail.id;
     } else if (!started && nextCount >= 0) {
@@ -622,12 +630,22 @@ export async function getUsageDb(sinceIso?: string | null, limit?: number, curso
       apiKeyName: toStringOrNull(r.api_key_name),
       serviceTier: normalizeServiceTier(r.service_tier),
       tokens: {
-        input: toNumber(r.tokens_input),
-        output: toNumber(r.tokens_output),
-        cacheRead: toNumber(r.tokens_cache_read),
-        cacheCreation: toNumber(r.tokens_cache_creation),
-        reasoning: toNumber(r.tokens_reasoning),
+        input: r.tokens_input == null ? null : toNumber(r.tokens_input),
+        output: r.tokens_output == null ? null : toNumber(r.tokens_output),
+        cacheRead: r.tokens_cache_read == null ? null : toNumber(r.tokens_cache_read),
+        cacheCreation: r.tokens_cache_creation == null ? null : toNumber(r.tokens_cache_creation),
+        reasoning: r.tokens_reasoning == null ? null : toNumber(r.tokens_reasoning),
+        noCache: r.tokens_no_cache == null ? null : toNumber(r.tokens_no_cache),
+        inputStatus: toStringOrNull(r.usage_input_status) || "legacy_unknown",
+        outputStatus: toStringOrNull(r.usage_output_status) || "legacy_unknown",
+        cacheReadStatus: toStringOrNull(r.usage_cache_read_status) || "legacy_unknown",
+        cacheCreationStatus: toStringOrNull(r.usage_cache_creation_status) || "legacy_unknown",
+        reasoningStatus: toStringOrNull(r.usage_reasoning_status) || "legacy_unknown",
+        noCacheStatus: toStringOrNull(r.usage_no_cache_status) || "legacy_unknown",
       },
+      sourceKind: toStringOrNull(r.usage_source_kind) || "unknown",
+      sourceLabel: toStringOrNull(r.usage_source_label) || "Usage source unavailable",
+      ingestion: toStringOrNull(r.usage_ingestion) || "legacy",
       status: toStringOrNull(r.status),
       success: toNumber(r.success) === 1,
       latencyMs: toNumber(r.latency_ms),
@@ -684,25 +702,80 @@ export interface UsageEntry {
   /** @deprecated legacy snake_case fallback, read only if `comboStrategy` is unset. */
   combo_strategy?: string | null;
   endpoint?: string | null;
+  /** User-initiated normalized usage-file import metadata. */
+  sourceKind?: "local" | "cloud-api" | "subscription" | "imported" | "unknown";
+  sourceLabel?: string | null;
+  importEventId?: string | null;
+  ingestion?: "capture" | "import";
+  inputStatus?: "reported" | "estimated" | "unavailable" | "legacy_unknown";
+  outputStatus?: "reported" | "estimated" | "unavailable" | "legacy_unknown";
+  cacheReadStatus?: "reported" | "unavailable" | "legacy_unknown";
+  cacheCreationStatus?: "reported" | "unavailable" | "legacy_unknown";
+  reasoningStatus?: "reported" | "unavailable" | "legacy_unknown";
+  noCacheStatus?: "reported" | "unavailable" | "legacy_unknown";
+  sourceReportedInput?: number | null;
 }
 
 /**
  * Save request usage entry to SQLite.
  */
 export async function saveRequestUsage(entry: UsageEntry) {
-  if (!shouldPersistToDisk) return;
+  if (!shouldPersistToDisk) return false;
 
   try {
     const db = getDbInstance();
     const timestamp = entry.timestamp || new Date().toISOString();
     const serviceTier = normalizeServiceTier(entry.serviceTier ?? entry.service_tier);
 
-    const tokensInput = getLoggedInputTokens(entry.tokens);
-    const tokensOutput = getLoggedOutputTokens(entry.tokens);
+    const tokensInput = getLoggedInputTokensOrNull(entry.tokens);
+    const tokensOutput = getLoggedOutputTokensOrNull(entry.tokens);
+    const cacheRead = getPromptCacheReadTokensOrNull(entry.tokens);
+    const cacheCreation = getPromptCacheCreationTokensOrNull(entry.tokens);
+    const reasoning = getReasoningTokensOrNull(entry.tokens);
+    const noCache = getNoCacheTokens(entry.tokens);
+    const inputStatus =
+      entry.inputStatus ||
+      (tokensInput === null
+        ? "unavailable"
+        : isInputUsageEstimated(entry.tokens)
+          ? "estimated"
+          : "reported");
+    const outputStatus =
+      entry.outputStatus ||
+      (tokensOutput === null
+        ? "unavailable"
+        : isOutputUsageEstimated(entry.tokens)
+          ? "estimated"
+          : "reported");
+    const sourceReportedInput =
+      getSourceReportedInputTokens(entry.tokens) ?? entry.sourceReportedInput ?? null;
     const connection = entry.connectionId
       ? (db.prepare("SELECT * FROM provider_connections WHERE id = ?").get(entry.connectionId) as
           Record<string, unknown> | undefined)
       : undefined;
+    const providerId = entry.provider ? resolveProviderId(entry.provider) : null;
+    const connectionAuthType = String(
+      connection?.auth_type ?? connection?.authType ?? ""
+    ).toLowerCase();
+    const sourceKind =
+      entry.sourceKind ||
+      (isLocalProvider(providerId)
+        ? "local"
+        : isFlatRateProvider(providerId) ||
+            ((providerId === "codex" || providerId === "cx") && connectionAuthType === "oauth")
+          ? "subscription"
+          : providerId
+            ? "cloud-api"
+            : "unknown");
+    const sourceLabel =
+      entry.sourceLabel ||
+      (sourceKind === "local"
+        ? "Local model server response usage metadata"
+        : sourceKind === "subscription"
+          ? "Subscription-backed connection response usage metadata"
+          : sourceKind === "cloud-api"
+            ? "Cloud provider response usage metadata"
+            : "Usage source unavailable");
     const accountIdentity = connection
       ? resolveUsageAccountIdentity(connection)
       : resolveOrphanedUsageAccountIdentity(entry.provider, entry.connectionId);
@@ -725,18 +798,46 @@ export async function saveRequestUsage(entry: UsageEntry) {
              AND COALESCE(model, '')        = COALESCE(?, '')
              AND COALESCE(connection_id, '') = COALESCE(?, '')
              AND COALESCE(api_key_id, '')   = COALESCE(?, '')
-             AND tokens_input  = ?
-             AND tokens_output = ?
+             AND tokens_input IS ?
+             AND tokens_output IS ?
+             AND tokens_cache_read IS ?
+             AND tokens_cache_creation IS ?
+             AND tokens_reasoning IS ?
+             AND tokens_no_cache IS ?
+             AND usage_input_status = ?
+             AND usage_output_status = ?
+             AND usage_cache_read_status = ?
+             AND usage_cache_creation_status = ?
+             AND usage_reasoning_status = ?
+             AND usage_no_cache_status = ?
+             AND tokens_input_source_reported IS ?
+             AND usage_source_kind = ?
+             AND usage_ingestion = ?
+             AND COALESCE(import_event_id, '') = COALESCE(?, '')
            ORDER BY id DESC LIMIT 1`
         )
         .get(
           timestamp,
-          (entry.provider ? resolveProviderId(entry.provider) : null),
+          entry.provider ? resolveProviderId(entry.provider) : null,
           entry.model || null,
           entry.connectionId || null,
           entry.apiKeyId || null,
           tokensInput,
-          tokensOutput
+          tokensOutput,
+          cacheRead,
+          cacheCreation,
+          reasoning,
+          noCache,
+          inputStatus,
+          outputStatus,
+          entry.cacheReadStatus || (cacheRead === null ? "unavailable" : "reported"),
+          entry.cacheCreationStatus || (cacheCreation === null ? "unavailable" : "reported"),
+          entry.reasoningStatus || (reasoning === null ? "unavailable" : "reported"),
+          entry.noCacheStatus || (noCache === null ? "unavailable" : "reported"),
+          sourceReportedInput,
+          sourceKind,
+          entry.ingestion || "capture",
+          entry.importEventId || null
         ) as { id: number; endpoint: string | null } | undefined;
 
       if (existing) {
@@ -755,11 +856,15 @@ export async function saveRequestUsage(entry: UsageEntry) {
         INSERT INTO usage_history (provider, model, connection_id, account_key, account_label,
           account_label_priority, api_key_id, api_key_name, tokens_input, tokens_output,
           tokens_cache_read, tokens_cache_creation, tokens_reasoning, service_tier, status, success,
-          latency_ms, ttft_ms, error_code, combo_strategy, endpoint, timestamp)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+          latency_ms, ttft_ms, error_code, combo_strategy, endpoint, timestamp,
+          usage_input_status, usage_output_status, usage_cache_read_status,
+          usage_cache_creation_status, usage_reasoning_status, tokens_input_source_reported,
+          usage_source_kind, usage_source_label, import_event_id, usage_ingestion,
+          tokens_no_cache, usage_no_cache_status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `
       ).run(
-        (entry.provider ? resolveProviderId(entry.provider) : null),
+        providerId,
         entry.model || null,
         entry.connectionId || null,
         accountIdentity.accountKey,
@@ -769,9 +874,9 @@ export async function saveRequestUsage(entry: UsageEntry) {
         entry.apiKeyName || null,
         tokensInput,
         tokensOutput,
-        getPromptCacheReadTokens(entry.tokens),
-        getPromptCacheCreationTokens(entry.tokens),
-        getReasoningTokens(entry.tokens),
+        cacheRead,
+        cacheCreation,
+        reasoning,
         serviceTier,
         entry.status || null,
         entry.success === false ? 0 : 1,
@@ -784,7 +889,19 @@ export async function saveRequestUsage(entry: UsageEntry) {
         entry.errorCode || null,
         entry.comboStrategy || entry.combo_strategy || null,
         entry.endpoint || null,
-        timestamp
+        timestamp,
+        inputStatus,
+        outputStatus,
+        entry.cacheReadStatus || (cacheRead === null ? "unavailable" : "reported"),
+        entry.cacheCreationStatus || (cacheCreation === null ? "unavailable" : "reported"),
+        entry.reasoningStatus || (reasoning === null ? "unavailable" : "reported"),
+        sourceReportedInput,
+        sourceKind,
+        sourceLabel,
+        entry.importEventId || null,
+        entry.ingestion || "capture",
+        noCache,
+        entry.noCacheStatus || (noCache === null ? "unavailable" : "reported")
       );
 
       inserted = true;
@@ -796,8 +913,10 @@ export async function saveRequestUsage(entry: UsageEntry) {
     if (inserted) {
       emitUsageRecorded(entry.provider, entry.connectionId);
     }
+    return inserted;
   } catch (error) {
     console.error("Failed to save usage stats:", error);
+    return false;
   }
 }
 

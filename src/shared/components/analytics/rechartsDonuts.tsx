@@ -16,6 +16,7 @@ function CompactDonutCard({
   pieData,
   title,
   formatter,
+  subtitle,
   valueClassName = "text-text-muted",
   labelClassName = "",
   getLegendKey,
@@ -34,6 +35,7 @@ function CompactDonutCard({
       <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
         {title}
       </h3>
+      {subtitle && <p className="text-[11px] text-text-muted -mt-2 mb-3">{subtitle}</p>}
       <div className="flex items-center gap-4">
         <ResponsiveContainer width={120} height={120}>
           <PieChart>
@@ -156,16 +158,16 @@ export function ApiKeyDonut({ byApiKey }) {
 export function ProviderCostDonut({ byProvider }) {
   const t = useTranslations("analytics");
   const data = useMemo(() => byProvider || [], [byProvider]);
-  const hasData = data.length > 0 && data.some((p) => p.cost > 0);
+  const hasData = data.length > 0 && data.some((p) => Number(p.cost || 0) > 0);
 
   const pieData = useMemo(() => {
     return data
-      .filter((item) => item.cost > 0)
-      .sort((a, b) => b.cost - a.cost)
+      .filter((item) => Number(item.cost || 0) > 0)
+      .sort((a, b) => Number(b.cost || 0) - Number(a.cost || 0))
       .slice(0, 8)
       .map((item, i) => ({
         name: item.provider,
-        value: item.cost,
+        value: Number(item.cost || 0),
         fill: PROVIDER_COLORS[i % PROVIDER_COLORS.length],
       }));
   }, [data]);
@@ -176,6 +178,9 @@ export function ProviderCostDonut({ byProvider }) {
         <h3 className="text-sm font-semibold text-text-muted uppercase tracking-wider mb-3">
           {t("chartCostByProvider")}
         </h3>
+        <p className="text-[11px] text-text-muted -mt-2 mb-3">
+          Estimate from configured prices; unpriced and flat-rate usage is omitted.
+        </p>
         <div className="text-center text-text-muted text-sm py-8">{t("chartNoCostData")}</div>
       </Card>
     );
@@ -185,7 +190,8 @@ export function ProviderCostDonut({ byProvider }) {
     <CompactDonutCard
       pieData={pieData}
       title={t("chartCostByProvider")}
-      formatter={fmtCost}
+      formatter={(value) => `≈ ${fmtCost(value)}`}
+      subtitle="Estimated from configured token prices; unpriced and flat-rate usage is omitted."
       valueClassName="text-amber-500"
       labelClassName="capitalize"
     />

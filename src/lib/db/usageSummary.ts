@@ -23,7 +23,7 @@ export function sumUsageTokensThisMonth(db: SqliteAdapter = getDbInstance()): nu
       .prepare(
         `SELECT
            COALESCE((
-             SELECT SUM(tokens_input + tokens_output)
+             SELECT SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0))
              FROM usage_history
              WHERE timestamp >= strftime('%Y-%m-01T00:00:00.000Z','now')
                AND timestamp < strftime('%Y-%m-01T00:00:00.000Z','now','+1 month')

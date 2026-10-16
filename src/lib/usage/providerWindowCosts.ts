@@ -353,7 +353,7 @@ function fetchAggregatedUsageRows(filter: UsageHistoryFilter): AggregatedUsageCo
         COALESCE(SUM(tokens_cache_read), 0) as cacheReadTokens,
         COALESCE(SUM(tokens_cache_creation), 0) as cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens,
         MAX(timestamp) as lastUsed
       FROM usage_history
       WHERE ${filter.whereSql}
@@ -410,7 +410,7 @@ function fetchDetailedUsageRowsForApiKey(
         COALESCE(tokens_cache_read, 0) as cacheReadTokens,
         COALESCE(tokens_cache_creation, 0) as cacheCreationTokens,
         COALESCE(tokens_reasoning, 0) as reasoningTokens,
-        COALESCE(tokens_input + tokens_output, 0) as totalTokens,
+        COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0) as totalTokens,
         timestamp
       FROM usage_history
       WHERE ${filter.whereSql}

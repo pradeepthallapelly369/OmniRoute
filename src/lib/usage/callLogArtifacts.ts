@@ -62,7 +62,7 @@ function preserveErrorForSizeLimit(error: unknown): unknown {
 export type CallLogDetailState = "none" | "ready" | "missing" | "corrupt" | "legacy-inline";
 
 export type CallLogArtifact = {
-  schemaVersion: 5;
+  schemaVersion: 6;
   summary: {
     id: string;
     timestamp: string;
@@ -76,11 +76,19 @@ export type CallLogArtifact = {
     connectionId: string | null;
     duration: number;
     tokens: {
-      in: number;
-      out: number;
+      in: number | null;
+      out: number | null;
+      inputStatus: string;
+      outputStatus: string;
+      sourceReportedInput: number | null;
       cacheRead: number | null;
+      cacheReadStatus: string;
       cacheWrite: number | null;
+      cacheCreationStatus: string;
       reasoning: number | null;
+      reasoningStatus: string;
+      noCache: number | null;
+      noCacheStatus: string;
       compressed: number | null;
     };
     requestType: string | null;

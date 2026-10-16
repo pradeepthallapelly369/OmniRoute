@@ -16,11 +16,14 @@ export function DailyTrendChart({ dailyTrend }) {
       date: d.date.slice(5),
       [t("chartInput")]: d.promptTokens,
       [t("chartOutput")]: d.completionTokens,
-      [t("chartCost")]: d.cost || 0,
+      [t("chartCost")]: d.cost,
     }));
   }, [dailyTrend, t]);
 
-  const hasCost = useMemo(() => chartData.some((d) => d[t("chartCost")] > 0), [chartData, t]);
+  const hasCost = useMemo(
+    () => chartData.some((d) => typeof d[t("chartCost")] === "number" && d[t("chartCost")] > 0),
+    [chartData, t]
+  );
 
   if (!chartData.length) {
     return (
@@ -145,7 +148,11 @@ function CostTooltip({
           />
           <span>{entry.name}:</span>
           <span className="font-mono font-medium text-text-main">
-            {entry.name === t("chartCost") ? fmtCost(entry.value) : fmt(entry.value)}
+            {entry.name === t("chartCost")
+              ? entry.value == null
+                ? "—"
+                : `≈ ${fmtCost(entry.value)}`
+              : fmt(entry.value)}
           </span>
         </div>
       ))}

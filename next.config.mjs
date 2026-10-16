@@ -224,7 +224,7 @@ const nextConfig = {
   productionBrowserSourceMaps: false,
   // Issue #67: enable React Compiler — automates memoization, removes manual useCallback/useMemo debt.
   // See: https://next.dev/blog/react-compiler
-  reactCompiler: true,
+  reactCompiler: false,
   // OmniRoute is a proxy for AI APIs — request bodies routinely include
   // multi-MB payloads (vision models, image edits, base64-encoded files,
   // long chat histories with embedded images). Next.js's Server Action
@@ -323,6 +323,14 @@ const nextConfig = {
     ],
   },
   serverExternalPackages: [
+    "@aws-sdk/client-bedrock-runtime",
+    "@aws-sdk/credential-provider-node",
+    "@aws-sdk/credential-provider-ini",
+    "@aws-sdk/credential-provider-sso",
+    "@aws-sdk/client-bedrock-runtime",
+    "@aws-sdk/credential-provider-node",
+    "@aws-sdk/credential-provider-ini",
+    "@aws-sdk/credential-provider-sso",
     "pino",
     "pino-pretty",
     "thread-stream",

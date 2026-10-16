@@ -840,7 +840,13 @@ export default function RequestTimeline({
             <div className="flex justify-between gap-4">
               <span>{t("tokens")}</span>
               <span>
-                {hoveredLog.tokens.in.toLocaleString()} / {hoveredLog.tokens.out.toLocaleString()}
+                {hoveredLog.tokens.in == null
+                  ? `— (${hoveredLog.tokens.inputStatus || "unknown"})`
+                  : `${hoveredLog.tokens.in.toLocaleString()} (${hoveredLog.tokens.inputStatus || "legacy unknown"})`}
+                {" / "}
+                {hoveredLog.tokens.out == null
+                  ? `— (${hoveredLog.tokens.outputStatus || "unknown"})`
+                  : `${hoveredLog.tokens.out.toLocaleString()} (${hoveredLog.tokens.outputStatus || "legacy unknown"})`}
               </span>
             </div>
             {hoveredLog.error && (

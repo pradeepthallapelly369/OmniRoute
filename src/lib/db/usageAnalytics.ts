@@ -52,7 +52,7 @@ export function getUsageSummary(unifiedSource: string, params: AnalyticsParams):
         COALESCE(SUM(requests), 0) as totalRequests,
         COALESCE(SUM(tokens_input), 0) as promptTokens,
         COALESCE(SUM(tokens_output), 0) as completionTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens,
         COUNT(DISTINCT model) as uniqueModels,
         COUNT(DISTINCT COALESCE(NULLIF(account_key, ''), NULLIF(connection_id, ''))) as uniqueAccounts,
         COUNT(DISTINCT COALESCE(NULLIF(api_key_id, ''), NULLIF(api_key_name, ''))) as uniqueApiKeys,
@@ -104,7 +104,7 @@ export function getDailyUsage(unifiedSource: string, params: AnalyticsParams): D
         COALESCE(SUM(requests), 0) as requests,
         COALESCE(SUM(tokens_input), 0) as promptTokens,
         COALESCE(SUM(tokens_output), 0) as completionTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens
       FROM ${unifiedSource} AS _u
       GROUP BY DATE(timestamp)
       ORDER BY date ASC
@@ -179,7 +179,7 @@ export function getHeatmapRows(heatmapConditions: string[], params: AnalyticsPar
       `
       SELECT
         DATE(timestamp) as date,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens
       FROM usage_history
       WHERE ${heatmapConditions.join(" AND ")}
       GROUP BY DATE(timestamp)
@@ -227,7 +227,7 @@ export function getModelUsageRows(unifiedSource: string, params: AnalyticsParams
         COALESCE(SUM(tokens_cache_read), 0) as cacheReadTokens,
         COALESCE(SUM(tokens_cache_creation), 0) as cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens,
         COALESCE(AVG(latency_ms), 0) as avgLatencyMs,
         COALESCE(SUM(CASE WHEN success = 1 THEN requests ELSE 0 END), 0) as successfulRequests,
         COALESCE(MAX(timestamp), '') as lastUsed,
@@ -316,7 +316,7 @@ export function getProviderUsageRows(
         COALESCE(SUM(requests), 0) as requests,
         COALESCE(SUM(tokens_input), 0) as promptTokens,
         COALESCE(SUM(tokens_output), 0) as completionTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens,
         COALESCE(AVG(latency_ms), 0) as avgLatencyMs,
         COALESCE(SUM(CASE WHEN success = 1 THEN requests ELSE 0 END), 0) as successfulRequests
       FROM ${unifiedSource} AS _u
@@ -472,7 +472,7 @@ export function getAccountUsageRows(
         COUNT(account_events.id) as requests,
         COALESCE(SUM(account_events.tokens_input), 0) as promptTokens,
         COALESCE(SUM(account_events.tokens_output), 0) as completionTokens,
-        COALESCE(SUM(account_events.tokens_input + account_events.tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(account_events.tokens_input, 0) + COALESCE(account_events.tokens_output, 0)), 0) as totalTokens,
         COALESCE(AVG(account_events.latency_ms), 0) as avgLatencyMs,
         COALESCE(MAX(account_events.timestamp), '') as lastUsed
       FROM account_events
@@ -529,7 +529,7 @@ export function getApiKeyUsageRows(
         COALESCE(SUM(tokens_cache_read), 0) as cacheReadTokens,
         COALESCE(SUM(tokens_cache_creation), 0) as cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens
       FROM usage_history
       ${apiKeyWhereClause}
       GROUP BY DATE(timestamp), COALESCE(NULLIF(api_key_id, ''), NULLIF(api_key_name, ''), 'unknown'), NULLIF(api_key_id, ''), LOWER(provider), LOWER(model), serviceTier
@@ -577,7 +577,7 @@ export function getServiceTierUsageRows(
         COALESCE(SUM(tokens_cache_read), 0) as cacheReadTokens,
         COALESCE(SUM(tokens_cache_creation), 0) as cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens,
         COALESCE(SUM(stored_cost), 0.0) as storedCost,
         MAX(is_aggregated) as isAggregated
       FROM ${unifiedSource} AS _u
@@ -654,7 +654,7 @@ export function getWeeklyPatternRows(
           DATE(timestamp) as date,
           strftime('%w', timestamp) as dayOfWeek,
           COALESCE(SUM(requests), 0) as requests,
-          COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
+          COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens
         FROM ${unifiedSource} AS _u
         GROUP BY DATE(timestamp), strftime('%w', timestamp)
       )
@@ -770,7 +770,7 @@ export function getEndpointUsageRows(params: EndpointUsageParams = {}): Endpoint
         COALESCE(SUM(tokens_cache_read), 0) as cacheReadTokens,
         COALESCE(SUM(tokens_cache_creation), 0) as cacheCreationTokens,
         COALESCE(SUM(tokens_reasoning), 0) as reasoningTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens,
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens,
         COALESCE(AVG(latency_ms), 0) as avgLatencyMs,
         COALESCE(SUM(CASE WHEN success = 1 THEN 1 ELSE 0 END), 0) as successfulRequests,
         COALESCE(MAX(timestamp), '') as lastUsed
@@ -817,7 +817,7 @@ export function getProviderDailyUsageRows(
         COUNT(*) as requests,
         COALESCE(SUM(tokens_input), 0) as promptTokens,
         COALESCE(SUM(tokens_output), 0) as completionTokens,
-        COALESCE(SUM(tokens_input + tokens_output), 0) as totalTokens
+        COALESCE(SUM(COALESCE(tokens_input, 0) + COALESCE(tokens_output, 0)), 0) as totalTokens
       FROM ${unifiedSource} AS _u
       GROUP BY DATE(timestamp), LOWER(provider)
       ORDER BY date DESC, requests DESC

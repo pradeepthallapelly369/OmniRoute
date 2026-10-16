@@ -52,7 +52,20 @@ if (dev) {
   ensureNativeSqlite();
 }
 
+// The Linux desktop launcher sets this flag before starting the local systemd
+// service. Keep the DB encryption key in the OS credential store even though
+// this desktop shell runs OmniRoute as a local browser app rather than Electron.
+let desktopCredentialStore = null;
+if (process.env.OMNIROUTE_REQUIRE_OS_CREDENTIAL_STORE === "1") {
+  const { ensureDesktopStorageEncryptionKey } = await import("./desktop-credential-store.mjs");
+  desktopCredentialStore = await ensureDesktopStorageEncryptionKey();
+}
+
 const bootstrappedEnv = bootstrapEnv();
+if (desktopCredentialStore) {
+  const { markDesktopCredentialStoreReady } = await import("./desktop-credential-store.mjs");
+  markDesktopCredentialStoreReady(desktopCredentialStore.dataDir);
+}
 const runtimePorts = resolveRuntimePorts(bootstrappedEnv);
 const mergedEnv = withRuntimePortEnv(bootstrappedEnv, runtimePorts);
 
