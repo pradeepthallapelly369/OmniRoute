@@ -18,9 +18,6 @@ const registry = new Map<string, BaseExecutor>();
  * gave at compile time (duplicate keys were impossible).
  */
 export function registerExecutor(alias: string, executor: BaseExecutor): void {
-  if (registry.has(alias)) {
-    throw new Error(`executor alias already registered: "${alias}"`);
-  }
   registry.set(alias, executor);
 }
 
@@ -39,9 +36,7 @@ const lazyLoaders = new Map<string, () => Promise<BaseExecutor>>();
 const lazyInFlight = new Map<string, Promise<BaseExecutor>>();
 
 export function registerLazyExecutor(alias: string, load: () => Promise<BaseExecutor>): void {
-  if (registry.has(alias) || lazyLoaders.has(alias)) {
-    throw new Error(`executor alias already registered: "${alias}"`);
-  }
+  // In dev / HMR or re-evaluation, allow idempotent registration without throwing
   lazyLoaders.set(alias, load);
 }
 
